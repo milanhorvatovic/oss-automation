@@ -257,7 +257,10 @@ jobs:
             fail_disarmed
           fi
           if [[ "${SWITCH_OFF}" == "true" ]]; then
-            armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
+            if ! armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""'); then
+              echo "::error::Failed to query who armed auto-merge on the kill-switch path."
+              fail_disarmed
+            fi
             if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
               echo "Kill switch is off; disabling the App-armed auto-merge."
               gh pr merge --disable-auto "$PR_URL" 2>&1 || true

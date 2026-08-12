@@ -142,8 +142,12 @@ jobs:
           ENABLED: ${{ vars.DEPENDABOT_AUTOMERGE_ENABLED }}
         run: |
           set -euo pipefail
-          if [[ "${ENABLED:-}" == "true" ]]; then
-            echo "DEPENDABOT_AUTOMERGE_ENABLED=true; Dependabot autonomy is active."
+          enabled="${ENABLED:-}"
+          # GitHub expression comparisons are case-insensitive, so 'TRUE'
+          # activates the mutating steps' conditions; normalize here so this
+          # report never claims automation is off while the steps act.
+          if [[ "${enabled,,}" == "true" ]]; then
+            echo "DEPENDABOT_AUTOMERGE_ENABLED=${ENABLED}; Dependabot autonomy is active."
           else
             echo "::notice::DEPENDABOT_AUTOMERGE_ENABLED is '${ENABLED:-<unset>}' (not 'true'); the approve and arm steps are skipped. Set the calling repository's variable to 'true' to enable."
           fi

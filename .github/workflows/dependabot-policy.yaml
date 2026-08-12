@@ -266,8 +266,11 @@ jobs:
         run: |
           set -euo pipefail
           gh pr merge --disable-auto "$PR_URL" 2>&1 || true
-          auto_merge=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest')
-          if [[ "$auto_merge" != "null" ]]; then
+          # `--jq` renders a JSON null scalar as an empty string, so query a
+          # boolean instead of comparing the raw value against "null". Only a
+          # literal "false" passes; anything else fails closed.
+          armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')
+          if [[ "$armed" != "false" ]]; then
             echo "::error::Auto-merge is still enabled after applying a veto label. The PR may merge despite the hold; investigate immediately."
             exit 1
           fi

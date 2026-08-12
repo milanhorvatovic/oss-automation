@@ -141,6 +141,39 @@ jobs:
           client-id: ${{ secrets.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
 
+      # A PR approved as eligible on an earlier run can be reclassified as
+      # held — new commits reshaping the group, or a privileged list grown
+      # with no new PR commit at all, which even a consumer's stale-review
+      # dismissal cannot catch. Skipping the approve step revokes nothing,
+      # and the arm step keeps auto-merge armed, so the stale approval would
+      # merge a held update unattended. Dismiss the App's own active
+      # approvals whenever the derived tier is held; an unconfirmed
+      # dismissal is a hard error, same stance as the veto disarm.
+      - name: Dismiss stale approval on held tier
+        if: >-
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true') && !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          list_active_approvals() {
+            gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id"
+          }
+          list_active_approvals | while read -r review_id; do
+            echo "Dismissing stale approval ${review_id} by ${BOT_LOGIN}."
+            gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+              -f message="Dismissed by the Dependabot policy workflow: this update is now held (major or privileged) and requires a maintainer's approval."
+          done
+          remaining=$(list_active_approvals | wc -l | tr -d ' ')
+          if [[ "$remaining" != "0" ]]; then
+            echo "::error::A stale approval by ${BOT_LOGIN} is still active on a held update; the PR could merge without a maintainer's approval. Investigate immediately."
+            exit 1
+          fi
+
       # Fail-open on purpose: any failure warns and exits 0, leaving the PR
       # armed-but-unapproved so the merge waits for a maintainer instead.
       # errexit stays off; every external call is guarded with `if !` —

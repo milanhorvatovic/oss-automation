@@ -209,6 +209,33 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # fetch-metadata classifies from Dependabot's own commit, so the tier
+      # says nothing about commits other actors append to the same branch —
+      # an appended commit would ride the App approval through the review
+      # gate. Fail closed on any commit not verifiably authored by
+      # Dependabot or by the automation App itself (the reconciler's
+      # update-branch merges): no approval, no arm, and the revocation step
+      # below withdraws an earlier approval. Signature verification matters
+      # because author attribution alone is a forgeable email claim.
+      - name: Verify every commit is Dependabot's
+        id: authorship
+        if: env.AUTOMATION_SECRET_PRESENT == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APP_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          tampered=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq ".[] | select((((.author.login // \"\") != \"dependabot[bot]\") and ((.author.login // \"\") != \"${APP_LOGIN}\")) or (.commit.verification.verified != true)) | .sha" | wc -l | tr -d ' ')
+          if [[ "$tampered" != "0" ]]; then
+            echo "::warning::${tampered} commit(s) on this PR are not verifiably Dependabot's or the App's; treating the update as tampered — no approval, no arm, and any existing App approval is revoked."
+            echo "dependabot-only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependabot-only=true" >> "$GITHUB_OUTPUT"
+          fi
+
       # A PR's earlier approval and arm can outlive their justification: a
       # later run reclassifies it as held (regrouped commits, or a
       # privileged list grown with no new PR commit — which even a
@@ -221,7 +248,7 @@ jobs:
       # same stance as the veto disarm.
       - name: Revoke stale approval and arm
         if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT == 'true'
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
@@ -229,6 +256,7 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
           PR_URL: ${{ github.event.pull_request.html_url }}
           SWITCH_OFF: ${{ vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true' }}
+          TAMPERED: ${{ steps.authorship.outputs.dependabot-only == 'false' }}
         run: |
           set -euo pipefail
           list_active_approvals() {
@@ -249,7 +277,9 @@ jobs:
             exit 1
           }
           reason="this update is now held (major or privileged) and requires a maintainer's approval"
-          if [[ "${SWITCH_OFF}" == "true" ]]; then
+          if [[ "${TAMPERED}" == "true" ]]; then
+            reason="the pull request carries commits not verifiably authored by Dependabot"
+          elif [[ "${SWITCH_OFF}" == "true" ]]; then
             reason="the DEPENDABOT_AUTOMERGE_ENABLED kill switch is off"
           fi
           if ! ids=$(list_active_approvals); then
@@ -273,9 +303,9 @@ jobs:
             echo "::error::A stale approval by ${BOT_LOGIN} is still active; the PR could merge without a maintainer's approval. Investigate immediately."
             fail_disarmed
           fi
-          if [[ "${SWITCH_OFF}" == "true" ]]; then
+          if [[ "${SWITCH_OFF}" == "true" || "${TAMPERED}" == "true" ]]; then
             if ! armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""'); then
-              echo "::error::Failed to query who armed auto-merge on the kill-switch path."
+              echo "::error::Failed to query who armed auto-merge on the revocation path."
               fail_disarmed
             fi
             if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
@@ -298,7 +328,8 @@ jobs:
       # normalized to squash when it posts — otherwise the worker merges
       # with the stale method the moment the approval lands.
       - name: Arm squash auto-merge
-        if: vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        if: >-
+          steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -348,7 +379,7 @@ jobs:
       # the merge this approval may complete is the verified squash one.
       - name: Approve eligible update
         if: >-
-          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}

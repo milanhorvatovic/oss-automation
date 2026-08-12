@@ -291,7 +291,7 @@ jobs:
             echo "Dismissing stale approval ${review_id} by ${BOT_LOGIN}."
             if ! gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
               -f message="Dismissed by the Dependabot policy workflow: ${reason}."; then
-              echo "::error::Failed to dismiss stale approval ${review_id} by ${BOT_LOGIN}."
+              echo "::error::Failed to dismiss stale approval ${review_id} by ${BOT_LOGIN}. If the calling repository's ruleset restricts who may dismiss reviews, add the App to that allow list."
               fail_disarmed
             fi
           done <<<"$ids"
@@ -309,11 +309,11 @@ jobs:
               fail_disarmed
             fi
             if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
-              echo "Kill switch is off; disabling the App-armed auto-merge."
+              echo "Disabling the App-armed auto-merge: ${reason}."
               gh pr merge --disable-auto "$PR_URL" 2>&1 || true
               armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
               if [[ "$armed" != "false" ]]; then
-                echo "::error::Auto-merge is still enabled after the kill-switch revocation. Investigate immediately."
+                echo "::error::Auto-merge is still enabled after the revocation (${reason}). Investigate immediately."
                 exit 1
               fi
             elif [[ -n "$armed_by" ]]; then

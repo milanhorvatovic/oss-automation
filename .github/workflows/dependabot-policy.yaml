@@ -70,25 +70,26 @@ permissions:
 
 jobs:
   policy:
-    # Label events belong to disarm-on-veto; every other action re-derives
-    # the tier from fresh state (an unlabeled event may lift a veto).
-    # The veto check must sit here, not only on the steps: a vetoed PR's
-    # synchronize/reopened/unrelated-unlabeled run would otherwise enter the
-    # shared concurrency group, cancel an in-flight disarm-on-veto job, and
-    # then skip every mutating step — leaving auto-merge armed despite the
-    # hard stop. Skipped at job level, it never enters the group. Removing
-    # the last veto label still re-runs policy: that unlabeled payload no
+    # Every event on a non-vetoed PR re-derives the tier from fresh state —
+    # label events included, so the revocation paths truly land on the
+    # PR's next event of any kind. The veto check must sit here, not only
+    # on the steps: a vetoed PR's run would otherwise enter the shared
+    # concurrency group, cancel an in-flight disarm-on-veto job, and then
+    # skip every mutating step — leaving auto-merge armed despite the hard
+    # stop. Skipped at job level, it never enters the group. Removing the
+    # last veto label still re-runs policy: that unlabeled payload no
     # longer carries the label.
     if: >-
-      github.event.action != 'labeled' && !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
+      !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Serialize per PR; a newer run supersedes the in-flight one. Non-veto
-    # label events never enter the group (this job's `if:` skips them), so
-    # Dependabot's rapid post-open labeling cannot cancel the opening run.
+    # Serialize per PR; a newer opened/reopened/synchronize/unlabeled run
+    # supersedes the in-flight one, while Dependabot's rapid post-open
+    # label events queue instead of cancelling so they cannot strand the
+    # opening run mid-mutation.
     concurrency:
       group: dependabot-policy-${{ github.event.pull_request.number }}
-      cancel-in-progress: true
+      cancel-in-progress: ${{ github.event.action != 'labeled' }}
     env:
       # Step `if:` conditions cannot read the secrets context; surface the
       # presence of the App credential here (a boolean, never the value).
@@ -396,6 +397,14 @@ jobs:
           fi
           if [[ "$has_veto" == "true" ]]; then
             echo "A veto label was added after the workflow started; skipping approval."
+            exit 0
+          fi
+          if ! decision=$(gh pr view "$PR_URL" --json reviewDecision --jq '.reviewDecision // ""'); then
+            echo "::warning::Failed to query the review decision; skipping approval. The PR stays armed for a manual approval."
+            exit 0
+          fi
+          if [[ "$decision" == "APPROVED" ]]; then
+            echo "The PR is already approved; not posting another review."
             exit 0
           fi
           if ! gh pr review --approve --body "Auto-approved by the Dependabot policy workflow (patch/minor update, not privileged, no veto label)." "$PR_URL"; then

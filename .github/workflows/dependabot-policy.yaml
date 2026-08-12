@@ -20,10 +20,15 @@ name: Dependabot Policy
 # reconciler workflow re-drives dropped auto-merge fires on its cron.
 #
 # A red revocation run only blocks a merge when the consumer's ruleset
-# lists this workflow's contexts (the policy and disarm-on-veto jobs) as
-# required status checks: the token mint itself can fail (expired key,
-# App uninstalled), and no fallback can revoke without that token. Making
-# both contexts required is part of the consumer contract.
+# enforces it: the token mint itself can fail (expired key, App
+# uninstalled), and no fallback can revoke without that token. The callee
+# contexts cannot be required directly — the trust-guarded caller job
+# skips on non-Dependabot PRs and a skipped caller never emits the
+# `caller / callee` child contexts, so requiring them would strand every
+# human PR on a check that will never report. The consumer contract is an
+# always-run gate job in the caller (`needs` on the calling job,
+# `if: always()`, failing on a failed or cancelled result) with that
+# gate's context required.
 #
 # Fleet-fixed conventions, deliberately not inputs: the
 # DEPENDABOT_AUTOMERGE_ENABLED kill-switch variable, the trust-boundary and
@@ -32,7 +37,12 @@ name: Dependabot Policy
 # condition below relies on that.
 #
 # Checkout-free on purpose: PR code never executes here, so the App secrets
-# the caller maps are safe on Dependabot's pull_request events.
+# the caller maps are safe on Dependabot's pull_request events. The
+# triggering actor picks the secret store those events read — Dependabot's
+# own events read the Dependabot store, a maintainer's label events read
+# the Actions store — so the calling repository must hold the App
+# credential pair in BOTH stores, or runs arrive with empty credentials
+# depending on who triggered them.
 
 on:
   workflow_call:

@@ -165,32 +165,6 @@ jobs:
             echo "::notice::DEPENDABOT_AUTOMERGE_ENABLED is '${ENABLED:-<unset>}' (not 'true'); the approve and arm steps are skipped. Set the calling repository's variable to 'true' to enable."
           fi
 
-      # The revocation paths below need App credentials the caller may not
-      # have configured. When revocation is due but no credential exists,
-      # this read-only sentinel decides between the two possible worlds: a
-      # dormant repository (no bot approval, no bot-armed auto-merge — pass
-      # quietly) and credentials revoked after use (stale bot automation
-      # present that nothing can revoke — fail red so a consumer that makes
-      # this context required blocks the merge).
-      - name: Verify no stale automation exists without credentials
-        if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT != 'true'
-        env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          REPO: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: |
-          set -euo pipefail
-          bot_approvals=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-            --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
-          armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
-          if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
-            echo "::error::A bot-authored approval or bot-armed auto-merge exists on this PR, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
-            exit 1
-          fi
-          echo "No bot approval or bot-armed auto-merge present; nothing to revoke."
-
       # Short-lived App token for the approve, arm, and revocation calls —
       # minted whenever the credential is configured: with the kill switch
       # on the approve/arm steps need it, with the switch off or a held
@@ -222,9 +196,11 @@ jobs:
       # their own key under a Dependabot author line still verifies, so the
       # committer must be GitHub's web-flow, which both Dependabot commits
       # and API-created merges carry (verified against live commits).
+      # Runs with or without App credentials — GITHUB_TOKEN read suffices;
+      # with none the App identity is unknown, so its update-branch merges
+      # conservatively count as tampered until credentials return.
       - name: Verify every commit is Dependabot's
         id: authorship
-        if: env.AUTOMATION_SECRET_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APP_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
@@ -240,6 +216,33 @@ jobs:
           else
             echo "dependabot-only=true" >> "$GITHUB_OUTPUT"
           fi
+
+      # The revocation paths below need App credentials the caller may not
+      # have configured. When revocation is due — a held tier, the switch
+      # off, or a tampered PR — but no credential exists, this read-only
+      # sentinel decides between the two possible worlds: a dormant
+      # repository (no bot approval, no bot-armed auto-merge — pass
+      # quietly) and credentials revoked after use (stale bot automation
+      # present that nothing can revoke — fail red so a consumer that makes
+      # this context required blocks the merge).
+      - name: Verify no stale automation exists without credentials
+        if: >-
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT != 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          bot_approvals=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+            --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
+          armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
+          if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
+            echo "::error::A bot-authored approval or bot-armed auto-merge exists on this PR, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
+            exit 1
+          fi
+          echo "No bot approval or bot-armed auto-merge present; nothing to revoke."
 
       # A PR's earlier approval and arm can outlive their justification: a
       # later run reclassifies it as held (regrouped commits, or a

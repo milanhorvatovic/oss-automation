@@ -187,6 +187,10 @@ jobs:
         with:
           client-id: ${{ secrets.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
+          # Downscope from the App's full installation grant to what these
+          # jobs call: merge rights for auto-merge live under contents.
+          permission-contents: write
+          permission-pull-requests: write
 
       # A PR's earlier approval and arm can outlive their justification: a
       # later run reclassifies it as held (regrouped commits, or a
@@ -359,6 +363,10 @@ jobs:
         with:
           client-id: ${{ secrets.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
+          # Downscope from the App's full installation grant to what these
+          # jobs call: merge rights for auto-merge live under contents.
+          permission-contents: write
+          permission-pull-requests: write
 
       # Fail closed: --disable-auto's exit code is not trusted — it errors
       # when there is nothing to disable and can report success without

@@ -53,7 +53,15 @@ jobs:
   policy:
     # Label events belong to disarm-on-veto; every other action re-derives
     # the tier from fresh state (an unlabeled event may lift a veto).
-    if: github.event.action != 'labeled'
+    # The veto check must sit here, not only on the steps: a vetoed PR's
+    # synchronize/reopened/unrelated-unlabeled run would otherwise enter the
+    # shared concurrency group, cancel an in-flight disarm-on-veto job, and
+    # then skip every mutating step — leaving auto-merge armed despite the
+    # hard stop. Skipped at job level, it never enters the group. Removing
+    # the last veto label still re-runs policy: that unlabeled payload no
+    # longer carries the label.
+    if: >-
+      github.event.action != 'labeled' && !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
     runs-on: ubuntu-latest
     timeout-minutes: 10
     # Serialize per PR; a newer run supersedes the in-flight one. Non-veto
@@ -130,12 +138,12 @@ jobs:
           fi
 
       # Short-lived App token for the approve and arm calls. Skipped when the
-      # kill switch is off or a veto label is present, so a dormant repository
-      # never fails on absent secrets.
+      # kill switch is off, so a dormant repository never fails on absent
+      # secrets. Event-time veto state is already handled by the job's `if:`;
+      # the steps below re-check the live label state before acting.
       - name: Mint the automation-bot token
         id: bot-token
-        if: >-
-          !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        if: vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.automation-client-id }}
@@ -151,7 +159,7 @@ jobs:
       # dismissal is a hard error, same stance as the veto disarm.
       - name: Dismiss stale approval on held tier
         if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true') && !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
@@ -180,7 +188,7 @@ jobs:
       # preserve that pattern when extending.
       - name: Approve eligible update
         if: >-
-          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -203,8 +211,7 @@ jobs:
       # Held PRs reach this step too — armed but never approved; the calling
       # repository's ruleset holds the merge until the required review lands.
       - name: Arm squash auto-merge
-        if: >-
-          !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        if: vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}

@@ -28,7 +28,9 @@ name: Dependabot Policy
 # human PR on a check that will never report. The consumer contract is an
 # always-run gate job in the caller (`needs` on the calling job,
 # `if: always()`, failing on a failed or cancelled result) with that
-# gate's context required.
+# gate's context required. Changing the kill-switch variable emits no PR
+# event, so a flip takes effect per PR on that PR's next event; the
+# reconciler workflow's cron is the bounded-latency sweep across open PRs.
 #
 # Fleet-fixed conventions, deliberately not inputs: the
 # DEPENDABOT_AUTOMERGE_ENABLED kill-switch variable, the trust-boundary and
@@ -289,34 +291,12 @@ jobs:
             fi
           fi
 
-      # Fail-open on purpose: any failure warns and exits 0, leaving the PR
-      # armed-but-unapproved so the merge waits for a maintainer instead.
-      # errexit stays off; every external call is guarded with `if !` —
-      # preserve that pattern when extending.
-      - name: Approve eligible update
-        if: >-
-          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
-        env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
-          PR_URL: ${{ github.event.pull_request.html_url }}
-        run: |
-          set +e
-          set -uo pipefail
-          if ! has_veto=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
-            echo "::warning::Failed to query the veto-label state; skipping approval. The PR stays armed for a manual approval."
-            exit 0
-          fi
-          if [[ "$has_veto" == "true" ]]; then
-            echo "A veto label was added after the workflow started; skipping approval."
-            exit 0
-          fi
-          if ! gh pr review --approve --body "Auto-approved by the Dependabot policy workflow (patch/minor update, not privileged, no veto label)." "$PR_URL"; then
-            echo "::warning::Failed to post the approval review; the PR stays armed for a manual approval."
-            exit 0
-          fi
-
       # Held PRs reach this step too — armed but never approved; the calling
       # repository's ruleset holds the merge until the required review lands.
+      # Runs BEFORE the approve step on purpose: the approval can be the
+      # final merge requirement, so any wrong-method arm must already be
+      # normalized to squash when it posts — otherwise the worker merges
+      # with the stale method the moment the approval lands.
       - name: Arm squash auto-merge
         if: vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
@@ -360,6 +340,33 @@ jobs:
 
           echo "::error::The PR remains open without verified squash auto-merge. Confirm Allow auto-merge and squash merging are enabled in the calling repository and the App installation has Contents and Pull requests write access."
           exit 1
+
+      # Fail-open on purpose: any failure warns and exits 0, leaving the PR
+      # armed-but-unapproved so the merge waits for a maintainer instead.
+      # errexit stays off; every external call is guarded with `if !` —
+      # preserve that pattern when extending. Runs after the arm step so
+      # the merge this approval may complete is the verified squash one.
+      - name: Approve eligible update
+        if: >-
+          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set +e
+          set -uo pipefail
+          if ! has_veto=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
+            echo "::warning::Failed to query the veto-label state; skipping approval. The PR stays armed for a manual approval."
+            exit 0
+          fi
+          if [[ "$has_veto" == "true" ]]; then
+            echo "A veto label was added after the workflow started; skipping approval."
+            exit 0
+          fi
+          if ! gh pr review --approve --body "Auto-approved by the Dependabot policy workflow (patch/minor update, not privileged, no veto label)." "$PR_URL"; then
+            echo "::warning::Failed to post the approval review; the PR stays armed for a manual approval."
+            exit 0
+          fi
 
   disarm-on-veto:
     # Fires on any event whose current payload carries a veto label — the

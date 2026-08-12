@@ -177,21 +177,46 @@ jobs:
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           REPO: ${{ github.repository }}
           PR_NUMBER: ${{ github.event.pull_request.number }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -euo pipefail
           list_active_approvals() {
             gh api "repos/${REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
               --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id"
           }
-          list_active_approvals | while read -r review_id; do
+          # This check is not guaranteed to be a required status check in the
+          # consumer's ruleset, so a red job alone does not stop the merge the
+          # stale approval still satisfies. Before failing, kill the merge
+          # vector itself: disable auto-merge and verify it cleared.
+          fail_disarmed() {
+            gh pr merge --disable-auto "$PR_URL" 2>&1 || true
+            local armed
+            armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
+            if [[ "$armed" != "false" ]]; then
+              echo "::error::Auto-merge could not be confirmed disabled after a failed approval dismissal; the held update may still merge unattended. Investigate immediately."
+            fi
+            exit 1
+          }
+          if ! ids=$(list_active_approvals); then
+            echo "::error::Failed to list the App's active approvals on a held update."
+            fail_disarmed
+          fi
+          while read -r review_id; do
+            [[ -n "$review_id" ]] || continue
             echo "Dismissing stale approval ${review_id} by ${BOT_LOGIN}."
-            gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
-              -f message="Dismissed by the Dependabot policy workflow: this update is now held (major or privileged) and requires a maintainer's approval."
-          done
-          remaining=$(list_active_approvals | wc -l | tr -d ' ')
+            if ! gh api -X PUT "repos/${REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+              -f message="Dismissed by the Dependabot policy workflow: this update is now held (major or privileged) and requires a maintainer's approval."; then
+              echo "::error::Failed to dismiss stale approval ${review_id} by ${BOT_LOGIN}."
+              fail_disarmed
+            fi
+          done <<<"$ids"
+          if ! remaining=$(list_active_approvals | wc -l | tr -d ' '); then
+            echo "::error::Failed to re-verify the App's active approvals after dismissal."
+            fail_disarmed
+          fi
           if [[ "$remaining" != "0" ]]; then
             echo "::error::A stale approval by ${BOT_LOGIN} is still active on a held update; the PR could merge without a maintainer's approval. Investigate immediately."
-            exit 1
+            fail_disarmed
           fi
 
       # Fail-open on purpose: any failure warns and exits 0, leaving the PR

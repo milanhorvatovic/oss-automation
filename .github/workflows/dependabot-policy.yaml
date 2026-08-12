@@ -262,20 +262,33 @@ jobs:
 
           # `gh pr merge --auto` exits non-zero for benign reasons (already
           # armed, already merged); the verification loop below is the
-          # authoritative check, not this call's exit code.
+          # authoritative check, not this call's exit code. Armed alone is
+          # not success: a manual arm can carry MERGE or REBASE, and the
+          # enable call silently no-ops on an already-armed PR — the squash
+          # contract holds only when the verified method is SQUASH, so a
+          # wrong-method arm is disabled and re-armed.
           gh pr merge --auto --squash "$PR_URL" 2>&1 || true
           for attempt in {1..6}; do
             state=$(gh pr view "$PR_URL" --json state,autoMergeRequest)
             pr_state=$(jq -r '.state' <<<"$state")
-            armed=$(jq -r '.autoMergeRequest != null' <<<"$state")
-            if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" || "$armed" == "true" ]]; then
-              echo "PR is ${pr_state}; auto-merge armed=${armed}."
+            method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$state")
+            if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
+              echo "PR is ${pr_state}; nothing to arm."
               exit 0
+            fi
+            if [[ "$method" == "SQUASH" ]]; then
+              echo "Squash auto-merge is armed."
+              exit 0
+            fi
+            if [[ -n "$method" ]]; then
+              echo "Auto-merge is armed with ${method}; re-arming with squash."
+              gh pr merge --disable-auto "$PR_URL" 2>&1 || true
+              gh pr merge --auto --squash "$PR_URL" 2>&1 || true
             fi
             [[ "$attempt" -eq 6 ]] || sleep 2
           done
 
-          echo "::error::The PR remains open without auto-merge. Confirm Allow auto-merge is enabled in the calling repository and the App installation has Contents and Pull requests write access."
+          echo "::error::The PR remains open without verified squash auto-merge. Confirm Allow auto-merge and squash merging are enabled in the calling repository and the App installation has Contents and Pull requests write access."
           exit 1
 
   disarm-on-veto:

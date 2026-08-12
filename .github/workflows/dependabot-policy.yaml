@@ -70,6 +70,10 @@ jobs:
     concurrency:
       group: dependabot-policy-${{ github.event.pull_request.number }}
       cancel-in-progress: true
+    env:
+      # Step `if:` conditions cannot read the secrets context; surface the
+      # presence of the App credential here (a boolean, never the value).
+      AUTOMATION_SECRET_PRESENT: ${{ secrets.automation-client-id != '' }}
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -137,13 +141,19 @@ jobs:
             echo "::notice::DEPENDABOT_AUTOMERGE_ENABLED is '${ENABLED:-<unset>}' (not 'true'); the approve and arm steps are skipped. Set the calling repository's variable to 'true' to enable."
           fi
 
-      # Short-lived App token for the approve and arm calls. Skipped when the
-      # kill switch is off, so a dormant repository never fails on absent
-      # secrets. Event-time veto state is already handled by the job's `if:`;
-      # the steps below re-check the live label state before acting.
+      # Short-lived App token for the approve, arm, and held-tier cleanup
+      # calls. Minted when automation is enabled, and also — kill switch
+      # notwithstanding — when the derived tier is held: revoking a stale
+      # approval is a safety transition, not new automation, the same reason
+      # the veto disarm mints unconditionally. The empty-secret guard keeps
+      # a dormant repository from failing red on every major bump: absent
+      # credentials mean the App never approved anything, so there is
+      # nothing to clean up. Event-time veto state is already handled by the
+      # job's `if:`; the steps below re-check the live label state.
       - name: Mint the automation-bot token
         id: bot-token
-        if: vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        if: >-
+          env.AUTOMATION_SECRET_PRESENT == 'true' && (vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true' || steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true')
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
           client-id: ${{ secrets.automation-client-id }}
@@ -156,10 +166,12 @@ jobs:
       # and the arm step keeps auto-merge armed, so the stale approval would
       # merge a held update unattended. Dismiss the App's own active
       # approvals whenever the derived tier is held; an unconfirmed
-      # dismissal is a hard error, same stance as the veto disarm.
+      # dismissal is a hard error, same stance as the veto disarm. Runs
+      # regardless of the kill switch — revoking automation the switch can
+      # no longer vouch for is exactly what a kill switch is for.
       - name: Dismiss stale approval on held tier
         if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true') && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true') && env.AUTOMATION_SECRET_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]

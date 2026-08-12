@@ -69,11 +69,13 @@ jobs:
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Pick the most-severe update-type across the (possibly grouped) bump.
-      # The `else` defaults to semver-major, not patch: an empty or
-      # unrecognized updateType is unclassifiable, and the approve gate
-      # excludes semver-major, so defaulting there fails closed — an
-      # unclassifiable bump is armed but never auto-approved.
+      # Pick the most-severe update-type across the (possibly grouped) bump,
+      # failing closed on anything unclassifiable: an empty group or any
+      # member with a missing/unrecognized updateType forces semver-major,
+      # which the approve gate excludes — such a bump is armed but never
+      # auto-approved. The member check runs before the severity ranking on
+      # purpose: a grouped [patch, unknown] must not classify as patch on
+      # the strength of its recognized member alone.
       - name: Derive effective update-type
         id: effective
         env:
@@ -82,10 +84,11 @@ jobs:
           set -euo pipefail
           effective=$(jq -r '
             [.[] | .updateType]
-            | if any(. == "version-update:semver-major") then "version-update:semver-major"
+            | if length == 0 then "version-update:semver-major"
+              elif any(IN("version-update:semver-major", "version-update:semver-minor", "version-update:semver-patch") | not) then "version-update:semver-major"
+              elif any(. == "version-update:semver-major") then "version-update:semver-major"
               elif any(. == "version-update:semver-minor") then "version-update:semver-minor"
-              elif any(. == "version-update:semver-patch") then "version-update:semver-patch"
-              else "version-update:semver-major"
+              else "version-update:semver-patch"
               end
           ' <<<"$UPDATED_JSON")
           echo "update-type=$effective" >> "$GITHUB_OUTPUT"

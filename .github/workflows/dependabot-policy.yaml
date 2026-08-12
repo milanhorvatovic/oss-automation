@@ -11,7 +11,8 @@ name: Dependabot Policy
 #            dependency) -> arm only; the branch ruleset holds the merge
 #            until a maintainer's approval lands
 #   veto     (trust-boundary or security-review-required label) -> untouched;
-#            a label arriving later reactively disarms an already-armed PR
+#            a label arriving later reactively disarms an already-armed PR,
+#            and every later event on a still-vetoed PR retries the disarm
 #
 # Approval fails open — a failed approve warns and leaves the PR armed for
 # manual review. Disarming fails closed — an unconfirmed disarm is a hard
@@ -347,8 +348,16 @@ jobs:
           exit 1
 
   disarm-on-veto:
+    # Fires on any event whose current payload carries a veto label — the
+    # original veto `labeled` delivery satisfies this too. Wider than
+    # label-events-only on purpose: GitHub reports a skipped job as a
+    # passing required check, so if the first disarm failed, a
+    # synchronize/reopened/other-label event on the still-vetoed PR must
+    # retry the disarm rather than skip both jobs. The disarm is
+    # idempotent, and the shared concurrency group lets a replacement run
+    # cancel a stalled one.
     if: >-
-      github.event.action == 'labeled' && (github.event.label.name == 'trust-boundary' || github.event.label.name == 'security-review-required')
+      contains(github.event.pull_request.labels.*.name, 'trust-boundary') || contains(github.event.pull_request.labels.*.name, 'security-review-required')
     runs-on: ubuntu-latest
     timeout-minutes: 5
     # Shares the policy job's group so a veto label cancels an in-flight

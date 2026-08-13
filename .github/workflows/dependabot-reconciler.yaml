@@ -519,7 +519,11 @@ jobs:
       # squash, not CLEAN) is left untouched. The single live read below
       # is the mutation authority — the state step's snapshot is stale by
       # now — and the steps after this one trust the verified-armed
-      # output instead of re-deriving it.
+      # output instead of re-deriving it. Unlike the branch-update and
+      # re-drive grants, exhausted arm retries go red on purpose —
+      # policy's own arm stance — because they signal repository or App
+      # misconfiguration (auto-merge or squash disabled, missing App
+      # write access), not a race a later sweep would win.
       - name: Arm squash auto-merge
         id: arm
         if: >-

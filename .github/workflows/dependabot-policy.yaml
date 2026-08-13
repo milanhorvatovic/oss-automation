@@ -193,6 +193,37 @@ jobs:
           permission-contents: write
           permission-pull-requests: write
 
+      # The disarm-on-veto job covers events whose payload carries a veto,
+      # but the concurrency group holds a single pending slot and a newer
+      # policy event with a pre-veto payload can displace a pending disarm
+      # from it. Whichever policy run survives therefore enforces the hold
+      # itself: a live veto at run time gets a verified disarm before any
+      # other mutation, so no displaced or stale disarm run is ever needed.
+      - name: Disarm on live veto
+        id: live-veto
+        if: env.AUTOMATION_SECRET_PRESENT == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          PR_URL: ${{ github.event.pull_request.html_url }}
+        run: |
+          set -euo pipefail
+          if ! has_veto=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
+            echo "::error::Failed to query the live veto-label state; refusing to continue."
+            exit 1
+          fi
+          echo "veto=${has_veto}" >> "$GITHUB_OUTPUT"
+          if [[ "$has_veto" != "true" ]]; then
+            echo "No live veto label; policy continues."
+            exit 0
+          fi
+          gh pr merge --disable-auto "$PR_URL" 2>&1 || true
+          armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
+          if [[ "$armed" != "false" ]]; then
+            echo "::error::Auto-merge is still enabled under a live veto label. Investigate immediately."
+            exit 1
+          fi
+          echo "Auto-merge confirmed disabled under the live veto."
+
       # fetch-metadata classifies from Dependabot's own commit, so the tier
       # says nothing about commits other actors append to the same branch —
       # an appended commit would ride the App approval through the review
@@ -346,7 +377,7 @@ jobs:
       # with the stale method the moment the approval lands.
       - name: Arm squash auto-merge
         if: >-
-          steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          steps.live-veto.outputs.veto == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -396,7 +427,7 @@ jobs:
       # the merge this approval may complete is the verified squash one.
       - name: Approve eligible update
         if: >-
-          steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+          steps.live-veto.outputs.veto == 'false' && steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}

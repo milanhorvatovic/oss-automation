@@ -83,12 +83,13 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Serialize per PR without cancellation: runs queue in event order and
-    # each re-derives from live state, so a stale run still acts safely.
-    # Policy must never cancel — cancel-in-progress is evaluated by the
-    # incoming job, and a delayed non-label event whose payload predates a
-    # fresh veto would cancel the running disarm mid-disable, leaving the
-    # vetoed PR armed. disarm-on-veto stays the group's only preemptor.
+    # Serialize per PR without cancellation from this job. The group holds
+    # one running and at most one pending run — a newer event replaces the
+    # pending one, and execution order is not guaranteed — so correctness
+    # never leans on which run executes: every mutation reconciles against
+    # live state at run time. Policy must still never cancel, because a
+    # delayed pre-veto event would cancel a running disarm mid-disable;
+    # disarm-on-veto stays the group's only preemptor.
     concurrency:
       group: dependabot-policy-${{ github.event.pull_request.number }}
       cancel-in-progress: false
@@ -429,12 +430,17 @@ jobs:
               echo "Squash auto-merge is armed."
               exit 0
             fi
+            if [[ "$attempt" -eq 6 ]]; then
+              break
+            fi
             if [[ -n "$method" ]]; then
               echo "Auto-merge is armed with ${method}; re-arming with squash."
               gh pr merge --disable-auto "$PR_URL" 2>&1 || true
-              gh pr merge --auto --squash "$PR_URL" 2>&1 || true
+            else
+              echo "Auto-merge is not armed yet; retrying the enable."
             fi
-            [[ "$attempt" -eq 6 ]] || sleep 2
+            gh pr merge --auto --squash "$PR_URL" 2>&1 || true
+            sleep 2
           done
 
           echo "::error::The PR remains open without verified squash auto-merge. Confirm Allow auto-merge and squash merging are enabled in the calling repository and the App installation has Contents and Pull requests write access."

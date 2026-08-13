@@ -55,8 +55,10 @@ name: Dependabot Reconciler
 #                            the policy workflow on the merged head
 #                            (whose authorship check whitelists the App's
 #                            update-branch merges)
-#   App-armed, CLEAN,     -> auto-merge toggled off and on to re-fire a
-#   yet still open           dropped merge-worker run
+#   verified, CLEAN,      -> merged directly with the head pinned — a
+#   yet still open           dropped merge-worker fire; auto-merge
+#                            cannot be re-enabled on a clean PR, and a
+#                            wrong-method arm is disarmed first
 #   verified and armed,   -> the newest failed or cancelled policy run
 #   yet unapproved           for the verified head is re-run, so policy
 #                            itself re-decides the approve in its own
@@ -70,10 +72,15 @@ name: Dependabot Reconciler
 # needs dependabot/fetch-metadata, which reads the Dependabot PR event
 # context a cron run does not have. What the sweep can re-drive is the
 # decision's venue — re-running the newest failed or cancelled policy
-# run for the verified head (rerun-failed-jobs, so a caller's green
-# sibling jobs stay untouched). That path needs the App's Actions
-# repository permission; without the grant the sweep skips it with a
-# notice. A policy run that concluded green yet left no approval is
+# run for the verified head: failures via rerun-failed-jobs so a
+# caller's green sibling jobs stay untouched, a cancelled run re-run
+# whole because the failed-jobs endpoint does not restore cancelled
+# jobs — and only after verifying the caller workflow file is unchanged
+# between the run's head and the default branch, because a re-run
+# executes the original definition and inputs, and approving under a
+# since-tightened privileged list or an outdated policy pin would apply
+# obsolete rules. That path needs the App's Actions repository
+# permission; without the grant the sweep skips it with a notice. A policy run that concluded green yet left no approval is
 # deliberate — a held tier, or a fail-open approve skip — and stays with
 # a maintainer, as does a PR whose event delivery was lost so completely
 # that no run exists to re-run. After an off->on kill-switch flip the
@@ -375,7 +382,12 @@ jobs:
         if: >-
           steps.state.outputs.open == 'true' && steps.state.outputs.veto == 'false' && steps.state.outputs.draft == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token preferred for quota: GITHUB_TOKEN's requests count
+          # against the repository-wide 1,000/hour pool shared by every
+          # workflow run, and a full 256-PR sweep's reads would drain it;
+          # the installation token has its own, larger pool. GITHUB_TOKEN
+          # stays as the credential-less fallback.
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
           APP_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
@@ -681,7 +693,11 @@ jobs:
         if: >-
           steps.arm.outputs.verified-armed == 'true' && steps.update.outputs.updated != 'true'
         env:
-          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # App token for the PR and contents reads (quota, as in the
+          # authorship step); the Actions reads and the rerun POST use
+          # RERUN_TOKEN — the only credential here carrying the Actions
+          # scope.
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
           RERUN_TOKEN: ${{ steps.rerun-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
@@ -691,8 +707,11 @@ jobs:
             echo "::notice::The App token could not be minted with Actions write; grant the App the Actions repository permission (read and write) in the calling repository to enable the approval re-drive."
             exit 0
           fi
-          approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-            --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' ')
+          if ! approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+            --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' '); then
+            echo "::warning::Failed to list the PR's reviews; leaving the re-drive to the next sweep."
+            exit 0
+          fi
           if [[ "$approvals" != "0" ]]; then
             echo "An App approval is active; nothing to re-drive."
             exit 0
@@ -700,15 +719,16 @@ jobs:
           # A policy-calling run is identified by its referenced_workflows
           # entry naming this repo's policy workflow file — a first-class
           # join that survives caller and callee job renames, unlike job
-          # display names. Newest first; every read is guarded so a
-          # transient API failure warns as itself instead of masquerading
-          # as "no run exists".
-          if ! run_ids=$(gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=30" \
-            --jq '.workflow_runs[] | select(any(.referenced_workflows[]?; .path | contains(".github/workflows/dependabot-policy.yaml@"))) | .id'); then
+          # display names. Newest first, paginated so a label-churned head
+          # with many runs cannot push the policy run past the window;
+          # every read is guarded so a transient API failure warns as
+          # itself instead of masquerading as "no run exists".
+          if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
+            --jq '.workflow_runs[] | select(any(.referenced_workflows[]?; .path | contains(".github/workflows/dependabot-policy.yaml@"))) | [(.id | tostring), .path] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
             exit 0
           fi
-          if [[ -z "$run_ids" ]]; then
+          if [[ -z "$run_rows" ]]; then
             echo "::notice::No policy run exists for the verified head — the PR event delivery itself was lost; the approval waits for the PR's next Dependabot event or a maintainer."
             exit 0
           fi
@@ -722,9 +742,11 @@ jobs:
           # thing to re-run. An in-progress run supersedes everything
           # older: stand down and let it finish.
           target=""
+          target_path=""
           conclusion=""
-          for run_id in $run_ids; do
-            if ! run_status=$(gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '.status'); then
+          while IFS=$'\t' read -r run_id run_path; do
+            [[ -n "$run_id" ]] || continue
+            if ! run_status=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '.status'); then
               echo "::warning::Failed to read policy run ${run_id}; leaving the re-drive to the next sweep."
               exit 0
             fi
@@ -732,7 +754,7 @@ jobs:
               echo "Policy run ${run_id} is ${run_status}; leaving it to finish."
               exit 0
             fi
-            if ! job_conclusions=$(gh api "repos/${GH_REPO}/actions/runs/${run_id}/jobs?per_page=100" --paginate \
+            if ! job_conclusions=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}/jobs?per_page=100" --paginate \
               --jq '.jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""'); then
               echo "::warning::Failed to inspect the jobs of policy run ${run_id}; leaving the re-drive to the next sweep."
               exit 0
@@ -743,9 +765,10 @@ jobs:
               continue
             fi
             target="$run_id"
+            target_path="$run_path"
             conclusion="$job_conclusion"
             break
-          done
+          done <<<"$run_rows"
           if [[ -z "$target" ]]; then
             echo "::notice::Every policy run for the verified head skipped its policy job (veto-era payloads); the approval waits for the PR's next event."
             exit 0
@@ -755,8 +778,37 @@ jobs:
               echo "The policy job in run ${target} is green; the missing approval is policy's own verdict and stays with a maintainer."
               ;;
             failure|cancelled|timed_out)
-              echo "Re-running the failed jobs of policy run ${target} (policy job: ${conclusion}) so policy re-decides the approve."
-              if ! GH_TOKEN="$RERUN_TOKEN" gh api -X POST "repos/${GH_REPO}/actions/runs/${target}/rerun-failed-jobs"; then
+              # A re-run executes the run's original workflow definition
+              # and inputs — including the caller's policy pin and
+              # privileged-dependencies list. A caller updated since (an
+              # update that emits no PR event) would make the re-run
+              # apply obsolete rules, so re-drive only when the caller
+              # workflow file is byte-identical between the verified head
+              # and the default branch; anything else waits for a fresh
+              # event under the current contract.
+              if ! base_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}" --jq '.sha'); then
+                echo "::warning::Failed to read the caller workflow at the default branch; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              if ! head_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}?ref=${VERIFIED_HEAD}" --jq '.sha'); then
+                echo "::warning::Failed to read the caller workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              if [[ "$base_blob" != "$head_blob" ]]; then
+                echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
+                exit 0
+              fi
+              # rerun-failed-jobs restores failed jobs only — a cancelled
+              # job is not failed, so a cancelled run (the concurrency
+              # displacement case) is re-run whole instead.
+              if [[ "$conclusion" == "cancelled" ]]; then
+                echo "Re-running cancelled policy run ${target} in full so policy re-decides the approve."
+                rerun_endpoint="repos/${GH_REPO}/actions/runs/${target}/rerun"
+              else
+                echo "Re-running the failed jobs of policy run ${target} (policy job: ${conclusion}) so policy re-decides the approve."
+                rerun_endpoint="repos/${GH_REPO}/actions/runs/${target}/rerun-failed-jobs"
+              fi
+              if ! GH_TOKEN="$RERUN_TOKEN" gh api -X POST "$rerun_endpoint"; then
                 echo "::warning::Could not re-run policy run ${target} (runs older than 30 days cannot be re-run); leaving the approval to the next sweep or a maintainer."
               fi
               ;;

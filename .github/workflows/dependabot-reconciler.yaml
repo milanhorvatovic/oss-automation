@@ -766,6 +766,7 @@ jobs:
           # head several PRs (multi-base, a replacement PR) — so each
           # run must also carry this PR in its pull_requests association,
           # or another PR's green run could suppress this one's recovery.
+          # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
           if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
             --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."

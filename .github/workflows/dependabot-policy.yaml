@@ -4,7 +4,11 @@ name: Dependabot Policy
 # pull_request [opened, reopened, synchronize, labeled, unlabeled], carry the
 # trust guards (Dependabot authorship, same-repo head) as top-level `if:`
 # conjuncts, and delegate here at a full commit SHA — this workflow never
-# re-checks authorship.
+# re-checks authorship. The authorship guard must key on the PR author
+# (github.event.pull_request.user.login == 'dependabot[bot]'), never on
+# github.actor: the reconciler's branch updates emit synchronize events
+# whose actor is the App, and an actor-keyed guard would skip this
+# workflow on exactly those events.
 #
 #   eligible (patch/minor, not privileged, no veto label) -> approve + arm
 #   held     (effective update-type semver-major, or a privileged

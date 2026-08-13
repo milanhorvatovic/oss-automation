@@ -77,8 +77,11 @@ name: Dependabot Reconciler
 #                            event context; a green prior run is never
 #                            re-run — its verdict stands
 #
-# Anything else — merge conflicts, drafts, foreign approvals — is left
-# for manual triage, deliberately.
+# Anything else — merge conflicts, drafts, bot approvals the App cannot
+# attribute — is left for manual triage, deliberately. Which humans may
+# approve is the ruleset's jurisdiction, here as under auto-merge: a
+# recovery merge fires because the ruleset's requirements are met, not
+# because of who met them.
 #
 # The approve decision is never made here: deriving the update tier
 # needs dependabot/fetch-metadata, which reads the Dependabot PR event
@@ -661,7 +664,11 @@ jobs:
             # veto, and head checks; merge it directly, pinned to the
             # verified head so a racing push turns the merge into a
             # refused no-op, and leave any existing squash arm in place
-            # the whole time.
+            # the whole time. Approval provenance is deliberately not
+            # re-checked: CLEAN means the ruleset's requirements are
+            # satisfied, and which authorized reviewer satisfied them is
+            # the ruleset's jurisdiction — the worker this merge
+            # re-fires never checked either.
             echo "PR #${PR_NUMBER} is verified and CLEAN yet open — a dropped merge fire; merging directly."
             merge_rc=0
             merge_output=$(gh pr merge --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1) || merge_rc=$?

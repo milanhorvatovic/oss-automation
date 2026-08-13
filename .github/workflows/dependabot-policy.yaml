@@ -199,11 +199,14 @@ jobs:
       # from it. Whichever policy run survives therefore enforces the hold
       # itself: a live veto at run time gets a verified disarm before any
       # other mutation, so no displaced or stale disarm run is ever needed.
+      # Runs with or without App credentials — the read falls back to
+      # GITHUB_TOKEN, and with no App token to disarm with, a live veto
+      # over an armed auto-merge fails red rather than passing green (a
+      # later green run must never mask the disarm job's red).
       - name: Disarm on live veto
         id: live-veto
-        if: env.AUTOMATION_SECRET_PRESENT == 'true'
         env:
-          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -euo pipefail
@@ -214,6 +217,15 @@ jobs:
           echo "veto=${has_veto}" >> "$GITHUB_OUTPUT"
           if [[ "$has_veto" != "true" ]]; then
             echo "No live veto label; policy continues."
+            exit 0
+          fi
+          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+            armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
+            if [[ "$armed" != "false" ]]; then
+              echo "::error::A live veto label is present and auto-merge is armed, but the App credential is empty so it cannot be disarmed. Restore the credentials or disarm manually."
+              exit 1
+            fi
+            echo "Live veto with nothing armed; the hold is effective without credentials."
             exit 0
           fi
           gh pr merge --disable-auto "$PR_URL" 2>&1 || true

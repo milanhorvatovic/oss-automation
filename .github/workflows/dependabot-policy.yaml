@@ -248,10 +248,18 @@ jobs:
           PR_NUMBER: ${{ github.event.pull_request.number }}
         run: |
           set -euo pipefail
+          # The commits endpoint returns at most 250 commits no matter the
+          # pagination, and appended commits sit at the end — an attacker
+          # could overflow the window to hide one from the check. Compare
+          # the enumerated count against the PR's true total and treat any
+          # shortfall as tampering.
+          total=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.commits')
+          listed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq '.[].sha' | wc -l | tr -d ' ')
           tampered=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
             --jq ".[] | select((((.author.login // \"\") != \"dependabot[bot]\") and ((.author.login // \"\") != \"${APP_LOGIN}\")) or ((.committer.login // \"\") != \"web-flow\") or (.commit.verification.verified != true)) | .sha" | wc -l | tr -d ' ')
-          if [[ "$tampered" != "0" ]]; then
-            echo "::warning::${tampered} commit(s) on this PR are not verifiably Dependabot's or the App's; treating the update as tampered — no approval, no arm, and any existing App approval is revoked."
+          if [[ "$listed" != "$total" || "$tampered" != "0" ]]; then
+            echo "::warning::Tamper check failed: ${tampered} unverifiable commit(s), enumerated ${listed} of ${total}. Treating the update as tampered — no approval, no arm, and any existing App approval is revoked."
             echo "dependabot-only=false" >> "$GITHUB_OUTPUT"
           else
             echo "dependabot-only=true" >> "$GITHUB_OUTPUT"

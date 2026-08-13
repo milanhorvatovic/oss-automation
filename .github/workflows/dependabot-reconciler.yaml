@@ -307,12 +307,16 @@ jobs:
       # off-flip lands with bounded latency. Same semantics as policy's
       # revocation: dismiss the App's approvals, disarm the App-armed
       # auto-merge, leave a maintainer's arm alone, and treat an
-      # unconfirmed revocation as a hard error. Without credentials the
-      # read-only sentinel separates a dormant repository (pass quietly)
-      # from stale bot automation nothing can revoke (fail red).
+      # unconfirmed revocation as a hard error. Vetoed PRs are NOT
+      # exempt — the veto disarm above only kills the arm, and a stale
+      # App approval must not outlive the flip to become effective again
+      # when the veto lifts or someone re-arms by hand. Without
+      # credentials the read-only sentinel separates a dormant
+      # repository (pass quietly) from stale bot automation nothing can
+      # revoke (fail red).
       - name: Revoke stale automation while the switch is off
         if: >-
-          steps.state.outputs.open == 'true' && steps.state.outputs.veto == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true'
+          steps.state.outputs.open == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
@@ -614,6 +618,20 @@ jobs:
               echo "verified-armed=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
+            # A surviving wrong-method arm on this failure path means the
+            # earlier disarm did not land; a red job alone would not stop
+            # the worker from merging with the forbidden method, so kill
+            # the merge vector and verify before exiting — policy's
+            # fail-disarmed stance.
+            if [[ -n "$post_method" ]]; then
+              gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+              armed_now=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
+              if [[ "$armed_now" != "false" ]]; then
+                echo "::error::A ${post_method} auto-merge remains armed on the CLEAN PR after a failed disarm; it may merge with the forbidden method. Investigate immediately."
+                exit 1
+              fi
+              echo "The ${post_method} arm is confirmed disabled; the merge waits for a maintainer."
+            fi
             echo "::error::PR #${PR_NUMBER} reports CLEAN but the direct merge failed and no squash auto-merge is armed: ${merge_output}"
             exit 1
           fi
@@ -855,11 +873,15 @@ jobs:
                 echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
-              if ! base_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}?ref=${base_ref}" --jq '.sha'); then
+              # ref goes through -f so gh URL-encodes it: branch names
+              # may legally carry '#', '&', or '+', which inline in the
+              # query string would make this trust check read the wrong
+              # ref.
+              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_ref" --jq '.sha'); then
                 echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
-              if ! head_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}?ref=${VERIFIED_HEAD}" --jq '.sha'); then
+              if ! head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$VERIFIED_HEAD" --jq '.sha'); then
                 echo "::warning::Failed to read the caller workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi

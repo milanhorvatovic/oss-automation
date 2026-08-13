@@ -29,8 +29,11 @@ name: Dependabot Reconciler
 #
 # No trust guards in the caller: nothing here runs from a PR event or
 # executes PR code, and every candidate PR is re-verified inside the
-# sweep. No privileged-dependencies input either — that list gates only
-# approval, and the approve decision is never made here (see below).
+# sweep. The only input is policy-workflow — the repository-qualified
+# identity of the policy workflow the re-drive may re-run, defaulting to
+# this repository's own; forks of the fleet home override it. No
+# privileged-dependencies input — that list gates only approval, and the
+# approve decision is never made here (see below).
 # Optional: granting the App the Actions repository permission (read and
 # write) enables the failed-policy-run re-drive; every other path works
 # without that grant. The policy caller's trust guards must key on the
@@ -110,6 +113,18 @@ name: Dependabot Reconciler
 
 on:
   workflow_call:
+    inputs:
+      policy-workflow:
+        description: >-
+          Repository-qualified path of the policy reusable workflow whose
+          runs the approval re-drive may re-run. The referenced_workflows
+          entries this is matched against are repository-qualified, so a
+          basename alone would also match another repository's similarly
+          named workflow. Override only when the fleet home is a fork of
+          this repository.
+        required: false
+        type: string
+        default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
     secrets:
       automation-client-id:
         description: Client ID of the GitHub App that arms and disarms.
@@ -701,6 +716,7 @@ jobs:
           RERUN_TOKEN: ${{ steps.rerun-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
+          POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
           if [[ -z "${RERUN_TOKEN}" ]]; then
@@ -717,14 +733,17 @@ jobs:
             exit 0
           fi
           # A policy-calling run is identified by its referenced_workflows
-          # entry naming this repo's policy workflow file — a first-class
-          # join that survives caller and callee job renames, unlike job
-          # display names. Newest first, paginated so a label-churned head
+          # entry matching the policy-workflow input's full
+          # repository-qualified identity — a first-class join that
+          # survives caller and callee job renames, and that a basename
+          # match would not give: another repository's similarly named
+          # workflow on the same head must not suppress or redirect the
+          # re-drive. Newest first, paginated so a label-churned head
           # with many runs cannot push the policy run past the window;
           # every read is guarded so a transient API failure warns as
           # itself instead of masquerading as "no run exists".
           if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
-            --jq '.workflow_runs[] | select(any(.referenced_workflows[]?; .path | contains(".github/workflows/dependabot-policy.yaml@"))) | [(.id | tostring), .path] | @tsv'); then
+            --jq '.workflow_runs[] | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
             exit 0
           fi
@@ -759,7 +778,17 @@ jobs:
               echo "::warning::Failed to inspect the jobs of policy run ${run_id}; leaving the re-drive to the next sweep."
               exit 0
             fi
-            job_conclusion=$(sed -n '1p' <<<"$job_conclusions")
+            # The " / policy" suffix could also match a different reusable
+            # callee named policy inside the same run; one job cannot be
+            # told from the other by display name alone, so conflicting
+            # conclusions stand down to a human rather than letting an
+            # unrelated job's result drive the re-run.
+            unique_conclusions=$(sort -u <<<"$job_conclusions" | sed '/^$/d')
+            if [[ "$(wc -l <<<"$unique_conclusions" | tr -d ' ')" -gt 1 ]]; then
+              echo "::notice::Run ${run_id} carries multiple policy-suffixed jobs with conflicting conclusions ($(tr '\n' ' ' <<<"$unique_conclusions")); ambiguous — leaving it for manual triage."
+              exit 0
+            fi
+            job_conclusion=$(sed -n '1p' <<<"$unique_conclusions")
             if [[ "$job_conclusion" == "skipped" ]]; then
               echo "The policy job in run ${run_id} was skipped (a veto-era payload); checking the next older run."
               continue

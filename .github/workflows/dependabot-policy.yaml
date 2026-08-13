@@ -99,6 +99,12 @@ jobs:
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
+        # A failure here — e.g. a rewritten first commit the action cannot
+        # parse — must not abort the job before the tamper and revocation
+        # steps run. The empty fallback in the derivation classifies the
+        # result as unclassifiable -> semver-major, and the authorship
+        # check flags the rewrite itself.
+        continue-on-error: true
         uses: dependabot/fetch-metadata@25dd0e34f4fe68f24cc83900b1fe3fe149efef98 # v3.1.0
         with:
           github-token: ${{ secrets.GITHUB_TOKEN }}
@@ -107,13 +113,14 @@ jobs:
       # failing closed on anything unclassifiable: an empty group or any
       # member with a missing/unrecognized updateType forces semver-major,
       # which the approve gate excludes — such a bump is armed but never
-      # auto-approved. The member check runs before the severity ranking on
-      # purpose: a grouped [patch, unknown] must not classify as patch on
-      # the strength of its recognized member alone.
+      # auto-approved. A failed or empty metadata fetch lands here as the
+      # empty group via the '[]' fallback. The member check runs before the
+      # severity ranking on purpose: a grouped [patch, unknown] must not
+      # classify as patch on the strength of its recognized member alone.
       - name: Derive effective update-type
         id: effective
         env:
-          UPDATED_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+          UPDATED_JSON: ${{ steps.metadata.outputs.updated-dependencies-json || '[]' }}
         run: |
           set -euo pipefail
           effective=$(jq -r '
@@ -132,7 +139,7 @@ jobs:
       - name: Match updated dependencies against the privileged list
         id: privileged
         env:
-          UPDATED_JSON: ${{ steps.metadata.outputs.updated-dependencies-json }}
+          UPDATED_JSON: ${{ steps.metadata.outputs.updated-dependencies-json || '[]' }}
           PRIVILEGED_LIST: ${{ inputs.privileged-dependencies }}
         run: |
           set -euo pipefail

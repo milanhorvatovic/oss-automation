@@ -308,8 +308,19 @@ jobs:
             exit 0
           fi
           gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-          armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-          if [[ "$armed" != "false" ]]; then
+          # A merged PR also reads autoMergeRequest null, so the state
+          # must disambiguate: only an unmerged, unarmed PR confirms the
+          # hold landed — MERGED here means the prohibited merge fired
+          # mid-disarm.
+          if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+            echo "::error::Failed to verify the veto disarm on PR #${PR_NUMBER}."
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while the veto disarm was in flight — the hold did not land. Investigate immediately."
+            exit 1
+          fi
+          if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
             echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled under a live veto label. Investigate immediately."
             exit 1
           fi
@@ -354,10 +365,17 @@ jobs:
           # complete a merge while the red run waits for a human.
           fail_disarmed() {
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-            local armed
-            armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-            if [[ "$armed" != "false" ]]; then
-              echo "::error::Auto-merge could not be confirmed disabled after a failed approval dismissal; the update may still merge unattended. Investigate immediately."
+            local verify
+            # A merged PR also reads autoMergeRequest null; only an
+            # unmerged, unarmed PR counts as a landed disarm.
+            if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the revocation was failing — stale automation may have completed the merge. Investigate immediately."
+              elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::Auto-merge could not be confirmed disabled after a failed approval dismissal; the update may still merge unattended. Investigate immediately."
+              fi
+            else
+              echo "::error::Failed to verify the disarm after the failed revocation."
             fi
             exit 1
           }
@@ -390,8 +408,15 @@ jobs:
           if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
             echo "Disabling the App-armed auto-merge: ${reason}."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-            armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-            if [[ "$armed" != "false" ]]; then
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm after the revocation (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while the revocation was in flight (${reason}) — stale automation may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
               echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled after the revocation (${reason}). Investigate immediately."
               exit 1
             fi
@@ -479,10 +504,17 @@ jobs:
           }
           fail_disarmed() {
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-            local armed
-            armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-            if [[ "$armed" != "false" ]]; then
-              echo "::error::Auto-merge could not be confirmed disabled on the tampered update. Investigate immediately."
+            local verify
+            # A merged PR also reads autoMergeRequest null; only an
+            # unmerged, unarmed PR counts as a landed disarm.
+            if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::The tampered PR #${PR_NUMBER} merged while the revocation was failing. Investigate immediately."
+              elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::Auto-merge could not be confirmed disabled on the tampered update. Investigate immediately."
+              fi
+            else
+              echo "::error::Failed to verify the disarm on the tampered update."
             fi
             exit 1
           }
@@ -515,8 +547,15 @@ jobs:
           if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
             echo "Disabling the App-armed auto-merge: ${reason}."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-            armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-            if [[ "$armed" != "false" ]]; then
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm after the tamper revocation."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::The tampered PR #${PR_NUMBER} merged while the revocation was in flight. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
               echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled after the tamper revocation. Investigate immediately."
               exit 1
             fi
@@ -568,8 +607,15 @@ jobs:
             echo "A veto label arrived after the sweep's read; refusing to arm and enforcing the hold now."
             if [[ "$(jq -r '.autoMergeRequest != null' <<<"$live")" != "false" ]]; then
               gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-              armed_check=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-              if [[ "$armed_check" != "false" ]]; then
+              if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                echo "::error::Failed to verify the veto disarm on PR #${PR_NUMBER}."
+                exit 1
+              fi
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the veto disarm was in flight — the hold did not land. Investigate immediately."
+                exit 1
+              fi
+              if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
                 echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled under a live veto label. Investigate immediately."
                 exit 1
               fi
@@ -664,8 +710,15 @@ jobs:
             # fail-disarmed stance.
             if [[ -n "$post_method" ]]; then
               gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
-              armed_now=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-              if [[ "$armed_now" != "false" ]]; then
+              if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                echo "::error::Failed to verify the disarm of the ${post_method} arm on the CLEAN PR."
+                exit 1
+              fi
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the ${post_method} arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings."
+                exit 1
+              fi
+              if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
                 echo "::error::A ${post_method} auto-merge remains armed on the CLEAN PR after a failed disarm; it may merge with the forbidden method. Investigate immediately."
                 exit 1
               fi
@@ -691,8 +744,20 @@ jobs:
             pr_state=$(jq -r '.state' <<<"$state")
             method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$state")
             live_head=$(jq -r '.headRefOid' <<<"$state")
-            if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
-              echo "PR is ${pr_state}; nothing to arm."
+            # A wrong-method arm can win from BLOCKED or UNSTABLE too —
+            # its last requirement can complete between the snapshot and
+            # the normalization disable — so MERGED counts as success
+            # only when no non-squash arm was observed on the way here.
+            if [[ "$pr_state" == "MERGED" ]]; then
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while a non-squash arm was being normalized — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings to make this race unrepresentable."
+                exit 1
+              fi
+              echo "PR is MERGED; nothing to arm."
+              exit 0
+            fi
+            if [[ "$pr_state" == "CLOSED" ]]; then
+              echo "PR is CLOSED; nothing to arm."
               exit 0
             fi
             if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
@@ -709,6 +774,7 @@ jobs:
             fi
             if [[ -n "$method" ]]; then
               echo "Auto-merge is armed with ${method}; re-arming with squash."
+              wrong_method_arm="true"
               gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
             else
               echo "Auto-merge is not armed yet; retrying the enable."

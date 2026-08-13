@@ -83,13 +83,15 @@ jobs:
       !contains(github.event.pull_request.labels.*.name, 'trust-boundary') && !contains(github.event.pull_request.labels.*.name, 'security-review-required')
     runs-on: ubuntu-latest
     timeout-minutes: 10
-    # Serialize per PR; a newer opened/reopened/synchronize/unlabeled run
-    # supersedes the in-flight one, while Dependabot's rapid post-open
-    # label events queue instead of cancelling so they cannot strand the
-    # opening run mid-mutation.
+    # Serialize per PR without cancellation: runs queue in event order and
+    # each re-derives from live state, so a stale run still acts safely.
+    # Policy must never cancel — cancel-in-progress is evaluated by the
+    # incoming job, and a delayed non-label event whose payload predates a
+    # fresh veto would cancel the running disarm mid-disable, leaving the
+    # vetoed PR armed. disarm-on-veto stays the group's only preemptor.
     concurrency:
       group: dependabot-policy-${{ github.event.pull_request.number }}
-      cancel-in-progress: ${{ github.event.action != 'labeled' }}
+      cancel-in-progress: false
     env:
       # Step `if:` conditions cannot read the secrets context; surface the
       # presence of the App credential here (a boolean, never the value).

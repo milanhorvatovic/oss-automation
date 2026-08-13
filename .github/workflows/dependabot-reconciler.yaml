@@ -11,6 +11,9 @@ name: Dependabot Reconciler
 #     schedule:
 #       - cron: "*/30 * * * *"
 #     workflow_dispatch:
+#   concurrency:
+#     group: dependabot-reconciler
+#     cancel-in-progress: false
 #   jobs:
 #     reconcile:
 #       permissions:
@@ -25,7 +28,13 @@ name: Dependabot Reconciler
 # The permissions block is required verbatim: a called workflow can only
 # downgrade the caller's token, never raise it, so on a repository or
 # org with a restricted default token an uncredentialed caller job fails
-# before a single step runs.
+# before a single step runs. The workflow-level concurrency block is
+# equally part of the contract: only the caller can serialize whole
+# sweeps (a called workflow's jobs cannot hold a group past their own
+# lifetime), and without it a slow sweep and the next cron tick run
+# duplicate matrices that double the eviction pressure inside the
+# per-PR groups. cancel-in-progress stays false so a running sweep is
+# never cancelled mid-mutation.
 #
 # No trust guards in the caller: nothing here runs from a PR event or
 # executes PR code, and every candidate PR is re-verified inside the
@@ -144,9 +153,12 @@ jobs:
   plan:
     runs-on: ubuntu-latest
     timeout-minutes: 5
-    # Overlapping sweeps add nothing: a newer enumeration supersedes a
-    # pending one wholesale. Cancelling plan is safe — no mutation
-    # happens before the per-PR jobs.
+    # Covers only this job — a job group cannot outlive its job, so it
+    # cannot stop two sweeps' matrices from overlapping; whole-sweep
+    # serialization is the caller's workflow-level concurrency block,
+    # per the contract above. This group merely collapses redundant
+    # enumerations when the caller omits that block. Cancelling plan is
+    # safe — no mutation happens before the per-PR jobs.
     concurrency:
       group: dependabot-reconciler-plan
       cancel-in-progress: true

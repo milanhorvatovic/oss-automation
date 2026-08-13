@@ -404,10 +404,18 @@ jobs:
             echo "::error::A stale approval by ${BOT_LOGIN} is still active on PR #${PR_NUMBER}. Investigate immediately."
             fail_disarmed
           fi
-          if ! armed_by=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""'); then
+          if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
             echo "::error::Failed to query who armed auto-merge on the revocation path."
             fail_disarmed
           fi
+          # A merged PR reads autoMergeRequest null too — an empty armer
+          # must not be mistaken for nothing-to-disable when the merge
+          # won the race against the dismissals.
+          if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while its approvals were being dismissed (${reason}) — the revocation did not land. Investigate immediately."
+            exit 1
+          fi
+          armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
           if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
             echo "Disabling the App-armed auto-merge: ${reason}."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
@@ -543,10 +551,18 @@ jobs:
             echo "::error::A stale approval by ${BOT_LOGIN} is still active on the tampered PR #${PR_NUMBER}. Investigate immediately."
             fail_disarmed
           fi
-          if ! armed_by=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""'); then
+          if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
             echo "::error::Failed to query who armed auto-merge on the revocation path."
             fail_disarmed
           fi
+          # A merged PR reads autoMergeRequest null too — an empty armer
+          # must not be mistaken for nothing-to-disable when the merge
+          # won the race against the dismissals.
+          if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while its approvals were being dismissed (${reason}) — the revocation did not land. Investigate immediately."
+            exit 1
+          fi
+          armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
           if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
             echo "Disabling the App-armed auto-merge: ${reason}."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
@@ -644,7 +660,14 @@ jobs:
             echo "verified-armed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          # Any initially-observed non-squash arm is recorded regardless
+          # of merge state: a MERGE/REBASE arm on a BLOCKED or UNSTABLE
+          # snapshot can fire before the loop's first read, and the
+          # MERGED checks below must know the method was never confirmed.
           wrong_method_arm="false"
+          if [[ "$armed" == "true" && -n "$merge_method" && "$merge_method" != "SQUASH" ]]; then
+            wrong_method_arm="true"
+          fi
           if [[ "$merge_state" == "CLEAN" && "$armed" == "true" && "$merge_method" != "SQUASH" ]]; then
             # The squash contract must decide this merge, not the
             # wrong-method arm the worker is about to fire — same
@@ -653,7 +676,6 @@ jobs:
             # merge below is the recovery, and the MERGED post-check
             # refuses to pass green unless this run's own squash request
             # is what won.
-            wrong_method_arm="true"
             echo "Auto-merge is armed with ${merge_method} by ${armed_by} on a CLEAN PR; disarming so the squash contract decides the merge."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
           fi
@@ -790,6 +812,25 @@ jobs:
             sleep 2
           done
 
+          # The retry limit must not leave an observed wrong-method arm
+          # live behind a red job — kill the merge vector and verify
+          # (including a merge racing the disarm) before exiting.
+          if [[ -n "$method" && "$method" != "SQUASH" ]]; then
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm of the ${method} arm after exhausting the arm retries."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while the ${method} arm was being disarmed after exhausted retries — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::A ${method} auto-merge remains armed after exhausted arm retries; it may merge with the forbidden method. Investigate immediately."
+              exit 1
+            fi
+            echo "The ${method} arm is confirmed disabled; the merge waits for a maintainer."
+          fi
           echo "::error::PR #${PR_NUMBER} remains open without verified squash auto-merge. Confirm Allow auto-merge and squash merging are enabled in the calling repository and the App installation has Contents and Pull requests write access."
           exit 1
 

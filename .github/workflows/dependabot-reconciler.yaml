@@ -561,7 +561,20 @@ jobs:
           fi
           has_veto=$(jq -r 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")' <<<"$live")
           if [[ "$has_veto" == "true" ]]; then
-            echo "A veto label arrived after the sweep's read; refusing to arm auto-merge."
+            # The label event behind this veto may itself be a dropped
+            # delivery — the disarm-on-veto run that should enforce the
+            # hold may never come, so enforce it here instead of only
+            # refusing to arm.
+            echo "A veto label arrived after the sweep's read; refusing to arm and enforcing the hold now."
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$live")" != "false" ]]; then
+              gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+              armed_check=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
+              if [[ "$armed_check" != "false" ]]; then
+                echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled under a live veto label. Investigate immediately."
+                exit 1
+              fi
+              echo "Auto-merge confirmed disabled under the live veto."
+            fi
             exit 0
           fi
           # Arming a head the tamper check never saw would hand auto-merge
@@ -582,12 +595,16 @@ jobs:
             echo "verified-armed=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
+          wrong_method_arm="false"
           if [[ "$merge_state" == "CLEAN" && "$armed" == "true" && "$merge_method" != "SQUASH" ]]; then
             # The squash contract must decide this merge, not the
             # wrong-method arm the worker is about to fire — same
             # normalization policy's arm step applies, regardless of who
             # armed it. The disarm may race the worker; the direct squash
-            # merge below is the recovery either way.
+            # merge below is the recovery, and the MERGED post-check
+            # refuses to pass green unless this run's own squash request
+            # is what won.
+            wrong_method_arm="true"
             echo "Auto-merge is armed with ${merge_method} by ${armed_by} on a CLEAN PR; disarming so the squash contract decides the merge."
             gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
           fi
@@ -600,7 +617,8 @@ jobs:
             # refused no-op, and leave any existing squash arm in place
             # the whole time.
             echo "PR #${PR_NUMBER} is verified and CLEAN yet open — a dropped merge fire; merging directly."
-            merge_output=$(gh pr merge --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1) || true
+            merge_rc=0
+            merge_output=$(gh pr merge --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1) || merge_rc=$?
             if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
               echo "::error::Failed to re-read PR #${PR_NUMBER} after the direct merge attempt."
               exit 1
@@ -609,8 +627,17 @@ jobs:
             post_method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$post")
             post_head=$(jq -r '.headRefOid' <<<"$post")
             if [[ "$post_state" == "MERGED" ]]; then
-              echo "PR is MERGED."
-              exit 0
+              # MERGED alone is not success when a wrong-method arm was in
+              # play: the worker may have fired with the forbidden method
+              # between the best-effort disarm and this run's squash
+              # request. Only this run's own successful squash confirms
+              # the contract held.
+              if [[ "$merge_rc" -eq 0 || "$wrong_method_arm" != "true" ]]; then
+                echo "PR is MERGED."
+                exit 0
+              fi
+              echo "::error::PR #${PR_NUMBER} merged, but not by this run's squash request while a ${merge_method} arm was failing to disarm — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings to make this race unrepresentable."
+              exit 1
             fi
             if [[ "$post_state" == "CLOSED" ]]; then
               echo "PR is CLOSED; nothing to merge."
@@ -794,11 +821,15 @@ jobs:
           # itself instead of masquerading as "no run exists". The
           # head_sha filter alone is not PR-specific — one commit can
           # head several PRs (multi-base, a replacement PR) — so each
-          # run must also carry this PR in its pull_requests association,
-          # or another PR's green run could suppress this one's recovery.
+          # run must also carry this PR in its pull_requests association.
+          # That association is itself match-based, not trigger-based
+          # (GitHub lists every open PR whose head matches the run), so a
+          # run associated with more than one PR cannot be attributed to
+          # a triggering PR at all — the walk below stands down on those
+          # rather than re-running another PR's event context.
           # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
           if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
-            --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv'); then
+            --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path, (.pull_requests | length | tostring)] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
             exit 0
           fi
@@ -818,8 +849,12 @@ jobs:
           target=""
           target_path=""
           conclusion=""
-          while IFS=$'\t' read -r run_id run_path; do
+          while IFS=$'\t' read -r run_id run_path pr_count; do
             [[ -n "$run_id" ]] || continue
+            if [[ "$pr_count" != "1" ]]; then
+              echo "::notice::Run ${run_id} is associated with ${pr_count} pull requests sharing this head; the API does not identify the triggering PR, so the re-drive stands down rather than re-running another PR's event context."
+              exit 0
+            fi
             if ! run_status=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '.status'); then
               echo "::warning::Failed to read policy run ${run_id}; leaving the re-drive to the next sweep."
               exit 0

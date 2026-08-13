@@ -608,13 +608,21 @@ jobs:
           VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
         run: |
           set -euo pipefail
-          if ! live=$(gh pr view "$PR_NUMBER" --json state,labels,autoMergeRequest,mergeStateStatus,headRefOid); then
+          if ! live=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus,headRefOid); then
             echo "::error::Failed to re-read PR #${PR_NUMBER} before arming; refusing to mutate blind."
             exit 1
           fi
           pr_state=$(jq -r '.state' <<<"$live")
           if [[ "$pr_state" != "OPEN" ]]; then
             echo "PR is ${pr_state}; nothing to arm."
+            exit 0
+          fi
+          # The snapshot gated drafts, but a conversion can land since:
+          # an unarmed draft cannot be armed (red noise), and an armed
+          # draft must not be certified verified-armed for the steps
+          # downstream — drafts stay manual triage, as documented.
+          if [[ "$(jq -r '.isDraft' <<<"$live")" == "true" ]]; then
+            echo "PR #${PR_NUMBER} became a draft after the sweep's read; leaving it for manual triage."
             exit 0
           fi
           has_veto=$(jq -r 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")' <<<"$live")
@@ -1053,16 +1061,25 @@ jobs:
               # rerun-failed-jobs restores failed jobs only — a cancelled
               # job is not failed, so a cancelled run (the concurrency
               # displacement case) is re-run whole instead.
-              # Last live-head check before the POST: a synchronize
-              # landing after the arm step's read would make this a
-              # stale-head re-run that displaces the pending
-              # current-head policy run in the shared single-slot group.
-              if ! live_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid'); then
-                echo "::warning::Failed to re-read the PR's head before the re-run; leaving the re-drive to the next sweep."
+              # Last live check before the POST: a synchronize landing
+              # after the arm step's read would make this a stale-head
+              # re-run that displaces the pending current-head policy
+              # run in the shared single-slot group — and a base
+              # retarget emits only an `edited` event, none of the
+              # policy caller's triggers, so the parity just verified
+              # would belong to the old base.
+              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName); then
+                echo "::warning::Failed to re-read the PR before the re-run; leaving the re-drive to the next sweep."
                 exit 0
               fi
+              live_head=$(jq -r '.headRefOid' <<<"$live_pr")
+              live_base=$(jq -r '.baseRefName' <<<"$live_pr")
               if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
                 echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); that event's policy run owns the new head."
+                exit 0
+              fi
+              if [[ "$live_base" != "$base_ref" ]]; then
+                echo "The PR was retargeted (${base_ref} -> ${live_base}) after the caller parity check; leaving the re-drive to the next sweep."
                 exit 0
               fi
               if [[ "$conclusion" == "cancelled" ]]; then

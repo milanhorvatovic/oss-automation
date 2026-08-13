@@ -79,7 +79,7 @@ name: Dependabot Reconciler
 # caller's green sibling jobs stay untouched, a cancelled run re-run
 # whole because the failed-jobs endpoint does not restore cancelled
 # jobs — and only after verifying the caller workflow file is unchanged
-# between the run's head and the default branch, because a re-run
+# between the run's head and the PR's base branch, because a re-run
 # executes the original definition and inputs, and approving under a
 # since-tightened privileged list or an outdated policy pin would apply
 # obsolete rules. That path needs the App's Actions repository
@@ -581,12 +581,13 @@ jobs:
             # the whole time.
             echo "PR #${PR_NUMBER} is verified and CLEAN yet open — a dropped merge fire; merging directly."
             merge_output=$(gh pr merge --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1) || true
-            if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+            if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
               echo "::error::Failed to re-read PR #${PR_NUMBER} after the direct merge attempt."
               exit 1
             fi
             post_state=$(jq -r '.state' <<<"$post")
             post_method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$post")
+            post_head=$(jq -r '.headRefOid' <<<"$post")
             if [[ "$post_state" == "MERGED" ]]; then
               echo "PR is MERGED."
               exit 0
@@ -595,17 +596,18 @@ jobs:
               echo "PR is CLOSED; nothing to merge."
               exit 0
             fi
+            # The head check precedes the surviving-arm check on purpose:
+            # a push racing the pinned merge leaves the old arm in place
+            # over a head this run never verified, and emitting
+            # verified-armed for it would key the update and re-drive
+            # steps to a stale head — that event's policy run owns it.
+            if [[ "$post_head" != "$VERIFIED_HEAD" ]]; then
+              echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${post_head}); the pinned merge refused correctly, and that event's policy run owns the new head."
+              exit 0
+            fi
             if [[ "$post_method" == "SQUASH" ]]; then
               echo "::warning::The direct merge did not land (${merge_output}); squash auto-merge remains armed for the worker."
               echo "verified-armed=true" >> "$GITHUB_OUTPUT"
-              exit 0
-            fi
-            if ! post_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid'); then
-              echo "::error::Failed to re-read PR #${PR_NUMBER}'s head after the refused merge."
-              exit 1
-            fi
-            if [[ "$post_head" != "$VERIFIED_HEAD" ]]; then
-              echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${post_head}); the pinned merge refused correctly, and that event's policy run owns the new head."
               exit 0
             fi
             echo "::error::PR #${PR_NUMBER} reports CLEAN but the direct merge failed and no squash auto-merge is armed: ${merge_output}"
@@ -815,8 +817,16 @@ jobs:
               # workflow file is byte-identical between the verified head
               # and the default branch; anything else waits for a fresh
               # event under the current contract.
-              if ! base_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}" --jq '.sha'); then
-                echo "::warning::Failed to read the caller workflow at the default branch; skipping the re-drive rather than re-running an unverified configuration."
+              # Compare against the PR's actual base branch, not the
+              # default branch — Dependabot PRs can target non-default
+              # branches, and it is the base's caller workflow whose
+              # tightening must not be bypassed by a re-run.
+              if ! base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName'); then
+                echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              if ! base_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}?ref=${base_ref}" --jq '.sha'); then
+                echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
               if ! head_blob=$(gh api "repos/${GH_REPO}/contents/${target_path}?ref=${VERIFIED_HEAD}" --jq '.sha'); then
@@ -830,6 +840,18 @@ jobs:
               # rerun-failed-jobs restores failed jobs only — a cancelled
               # job is not failed, so a cancelled run (the concurrency
               # displacement case) is re-run whole instead.
+              # Last live-head check before the POST: a synchronize
+              # landing after the arm step's read would make this a
+              # stale-head re-run that displaces the pending
+              # current-head policy run in the shared single-slot group.
+              if ! live_head=$(gh pr view "$PR_NUMBER" --json headRefOid --jq '.headRefOid'); then
+                echo "::warning::Failed to re-read the PR's head before the re-run; leaving the re-drive to the next sweep."
+                exit 0
+              fi
+              if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
+                echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); that event's policy run owns the new head."
+                exit 0
+              fi
               if [[ "$conclusion" == "cancelled" ]]; then
                 echo "Re-running cancelled policy run ${target} in full so policy re-decides the approve."
                 rerun_endpoint="repos/${GH_REPO}/actions/runs/${target}/rerun"

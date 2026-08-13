@@ -28,7 +28,8 @@ name: Dependabot Policy
 # human PR on a check that will never report. The consumer contract is an
 # always-run gate job in the caller (`needs` on the calling job,
 # `if: always()`, failing on a failed or cancelled result) with that
-# gate's context required. Changing the kill-switch variable emits no PR
+# gate's context required, plus stale-review dismissal on push so an
+# approval pinned to a verified head cannot outlive it. Changing the kill-switch variable emits no PR
 # event, so a flip takes effect per PR on that PR's next event; the
 # reconciler workflow's cron is the bounded-latency sweep across open PRs.
 #
@@ -266,7 +267,8 @@ jobs:
           # could overflow the window to hide one from the check. Compare
           # the enumerated count against the PR's true total and treat any
           # shortfall as tampering.
-          total=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '.commits')
+          IFS=$'\t' read -r total verified_head <<<"$(gh api "repos/${REPO}/pulls/${PR_NUMBER}" --jq '[.commits, .head.sha] | @tsv')"
+          echo "verified-head=${verified_head}" >> "$GITHUB_OUTPUT"
           listed=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
             --jq '.[].sha' | wc -l | tr -d ' ')
           tampered=$(gh api "repos/${REPO}/pulls/${PR_NUMBER}/commits" --paginate \
@@ -402,11 +404,20 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
         run: |
           set -euo pipefail
           has_veto=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")')
           if [[ "$has_veto" == "true" ]]; then
             echo "A veto label was added after the workflow started; refusing to arm auto-merge."
+            exit 0
+          fi
+          # Same head-consistency guard as the approval: arming a head the
+          # tamper check never saw would hand auto-merge to unverified
+          # content; the newer event's run owns the new head.
+          current_head=$(gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid')
+          if [[ "$current_head" != "$VERIFIED_HEAD" ]]; then
+            echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${current_head}); leaving arming to the newer event's run."
             exit 0
           fi
 
@@ -457,6 +468,9 @@ jobs:
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
+          REPO: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+          VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
         run: |
           set +e
           set -uo pipefail
@@ -476,7 +490,20 @@ jobs:
             echo "The PR is already approved; not posting another review."
             exit 0
           fi
-          if ! gh pr review --approve --body "Auto-approved by the Dependabot policy workflow (patch/minor update, not privileged, no veto label)." "$PR_URL"; then
+          # The tamper check ran on a recorded head; a commit appended since
+          # would be approved sight-unseen. Stand down if the head moved —
+          # the newer event's run owns the new head — and pin the approval
+          # to the verified commit so consumer-side stale-review dismissal
+          # invalidates it on any later push.
+          if ! current_head=$(gh pr view "$PR_URL" --json headRefOid --jq '.headRefOid'); then
+            echo "::warning::Failed to query the current head; skipping approval. The PR stays armed for a manual approval."
+            exit 0
+          fi
+          if [[ "$current_head" != "$VERIFIED_HEAD" ]]; then
+            echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${current_head}); leaving approval to the newer event's run."
+            exit 0
+          fi
+          if ! gh api -X POST "repos/${REPO}/pulls/${PR_NUMBER}/reviews" -f commit_id="$VERIFIED_HEAD" -f event=APPROVE -f body="Auto-approved by the Dependabot policy workflow (patch/minor update, not privileged, no veto label)."; then
             echo "::warning::Failed to post the approval review; the PR stays armed for a manual approval."
             exit 0
           fi

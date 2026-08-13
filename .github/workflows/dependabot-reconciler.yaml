@@ -729,7 +729,6 @@ jobs:
           # scope.
           GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
           RERUN_TOKEN: ${{ steps.rerun-token.outputs.token }}
-          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
           POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
@@ -738,13 +737,19 @@ jobs:
             echo "::notice::The App token could not be minted with Actions write; grant the App the Actions repository permission (read and write) in the calling repository to enable the approval re-drive."
             exit 0
           fi
-          if ! approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-            --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' '); then
-            echo "::warning::Failed to list the PR's reviews; leaving the re-drive to the next sweep."
+          # The live review decision, not a count of App approvals, is
+          # the gate: under a require-approval-of-most-recent-push rule
+          # an older review stays APPROVED without satisfying anything,
+          # and only the decision reflects what the merge actually
+          # requires — the same read policy consults. A held PR reads
+          # REVIEW_REQUIRED here and proceeds, and its green policy run
+          # below stands the re-drive down.
+          if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
+            echo "::warning::Failed to read the PR's review decision; leaving the re-drive to the next sweep."
             exit 0
           fi
-          if [[ "$approvals" != "0" ]]; then
-            echo "An App approval is active; nothing to re-drive."
+          if [[ "$decision" == "APPROVED" ]]; then
+            echo "The review requirements are satisfied; nothing to re-drive."
             exit 0
           fi
           # A policy-calling run is identified by its referenced_workflows
@@ -756,9 +761,13 @@ jobs:
           # re-drive. Newest first, paginated so a label-churned head
           # with many runs cannot push the policy run past the window;
           # every read is guarded so a transient API failure warns as
-          # itself instead of masquerading as "no run exists".
+          # itself instead of masquerading as "no run exists". The
+          # head_sha filter alone is not PR-specific — one commit can
+          # head several PRs (multi-base, a replacement PR) — so each
+          # run must also carry this PR in its pull_requests association,
+          # or another PR's green run could suppress this one's recovery.
           if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
-            --jq '.workflow_runs[] | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv'); then
+            --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
             exit 0
           fi

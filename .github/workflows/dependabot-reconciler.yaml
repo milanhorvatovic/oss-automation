@@ -619,14 +619,23 @@ jobs:
           # authoritative check, not this call's exit code. Armed alone is
           # not success: the squash contract holds only when the verified
           # method is SQUASH, so a wrong-method arm is disabled and
-          # re-armed.
-          gh pr merge --auto --squash "$PR_NUMBER" 2>&1 || true
+          # re-armed. Every enable — initial and retries — is pinned to
+          # the verified head, so a synchronize landing mid-loop makes
+          # the enable refuse instead of arming content the tamper check
+          # never inspected; the loop's own head read stands the run down
+          # the moment the head moves.
+          gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
           for attempt in {1..6}; do
-            state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest)
+            state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid)
             pr_state=$(jq -r '.state' <<<"$state")
             method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$state")
+            live_head=$(jq -r '.headRefOid' <<<"$state")
             if [[ "$pr_state" == "MERGED" || "$pr_state" == "CLOSED" ]]; then
               echo "PR is ${pr_state}; nothing to arm."
+              exit 0
+            fi
+            if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
+              echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); leaving arming to that event's policy run."
               exit 0
             fi
             if [[ "$method" == "SQUASH" ]]; then
@@ -643,7 +652,7 @@ jobs:
             else
               echo "Auto-merge is not armed yet; retrying the enable."
             fi
-            gh pr merge --auto --squash "$PR_NUMBER" 2>&1 || true
+            gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
             sleep 2
           done
 
@@ -820,7 +829,14 @@ jobs:
               # Compare against the PR's actual base branch, not the
               # default branch — Dependabot PRs can target non-default
               # branches, and it is the base's caller workflow whose
-              # tightening must not be bypassed by a re-run.
+              # tightening must not be bypassed by a re-run. Approximate
+              # by necessity: a re-run executes the run-era merge-time
+              # definition, which the API does not expose, so a base that
+              # changed after the run and reverted since passes this
+              # check while the re-run applies the run-era file. Every
+              # definition in that window was authored on the protected
+              # base branch, so the residual is maintainer config drift,
+              # not a trust-boundary breach.
               if ! base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName'); then
                 echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0

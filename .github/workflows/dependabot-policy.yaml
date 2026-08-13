@@ -491,13 +491,25 @@ jobs:
       # Fail closed: --disable-auto's exit code is not trusted — it errors
       # when there is nothing to disable and can report success without
       # taking effect. The re-query is the authoritative check, and an
-      # unconfirmed disarm is a hard error.
+      # unconfirmed disarm is a hard error. Execution order across the
+      # group is not guaranteed, so this run reconciles against live
+      # labels first: an older labeled run executing after the veto was
+      # lifted must not be the final writer that disarms a re-armed PR.
+      # A failed label query keeps the hold and proceeds with the disarm.
       - name: Disable auto-merge
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
         run: |
           set -euo pipefail
+          if ! live_veto=$(gh pr view "$PR_URL" --json labels --jq 'any(.labels[]; .name == "trust-boundary" or .name == "security-review-required")'); then
+            echo "::warning::Failed to query the live veto-label state; assuming the hold stands."
+            live_veto="true"
+          fi
+          if [[ "$live_veto" != "true" ]]; then
+            echo "The veto label is no longer present; leaving auto-merge as it is."
+            exit 0
+          fi
           gh pr merge --disable-auto "$PR_URL" 2>&1 || true
           # `--jq` renders a JSON null scalar as an empty string, so query a
           # boolean instead of comparing the raw value against "null". Only a

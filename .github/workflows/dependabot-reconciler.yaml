@@ -626,6 +626,19 @@ jobs:
             echo "Auto-merge was armed by ${armed_by}, not the App; leaving it in place."
           fi
 
+      # A verified PR the arm step cannot touch for lack of credentials
+      # is a misconfiguration, not dormancy: the kill switch being on
+      # declares automation wanted, and policy's own arm path fails red
+      # in the same state. Green-skipping here would silently leave the
+      # PR unreconciled forever.
+      - name: Fail on missing credentials with the switch on
+        if: >-
+          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT != 'true'
+        run: |
+          set -euo pipefail
+          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the automation-client-id secret is empty: PR #${PR_NUMBER} is verified and awaiting automation nothing can perform. Configure the App credentials or turn the kill switch off."
+          exit 1
+
       # Restores policy's arm invariant on a verified PR: unarmed gets
       # armed (a dropped opened-event delivery, an arm that failed red, or
       # an off->on switch flip all land here), and a wrong-method arm is
@@ -806,6 +819,23 @@ jobs:
             merge_output=$(gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/merge" -f merge_method=squash -f sha="$VERIFIED_HEAD" 2>&1) || merge_rc=$?
             if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
               echo "::error::Failed to re-read PR #${PR_NUMBER} after the direct merge attempt."
+              # A known non-squash arm must not outlive this failure
+              # path: disable and verify before going red, and surface a
+              # merge that raced the disarm.
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+                if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                  if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                    echo "::error::PR #${PR_NUMBER} merged while the non-squash arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit."
+                  elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                    echo "::error::A non-squash auto-merge may remain armed; it could merge with the forbidden method. Investigate immediately."
+                  else
+                    echo "The non-squash arm is confirmed disabled despite the failed read."
+                  fi
+                else
+                  echo "::error::Could not verify the non-squash arm's disarm after the failed read. Investigate immediately."
+                fi
+              fi
               exit 1
             fi
             post_state=$(jq -r '.state' <<<"$post")
@@ -889,6 +919,23 @@ jobs:
           for attempt in {1..6}; do
             if ! state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
               echo "::error::Failed to read PR #${PR_NUMBER} inside the arm verification loop."
+              # Same stance as the post-merge read failure: a known
+              # non-squash arm whose pre-loop disable may not have
+              # landed must not outlive a transient read failure.
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+                if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                  if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                    echo "::error::PR #${PR_NUMBER} merged while the non-squash arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit."
+                  elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                    echo "::error::A non-squash auto-merge may remain armed; it could merge with the forbidden method. Investigate immediately."
+                  else
+                    echo "The non-squash arm is confirmed disabled despite the failed read."
+                  fi
+                else
+                  echo "::error::Could not verify the non-squash arm's disarm after the failed read. Investigate immediately."
+                fi
+              fi
               exit 1
             fi
             pr_state=$(jq -r '.state' <<<"$state")
@@ -1066,7 +1113,9 @@ jobs:
             echo "The review requirements are satisfied, but possibly by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
           fi
           # A policy-calling run is identified by its referenced_workflows
-          # entry matching the policy-workflow input's full
+          # entry (present in the list response too — verified against
+          # the live API; the documented schema under-specifies it)
+          # matching the policy-workflow input's full
           # repository-qualified identity — a first-class join that
           # survives caller and callee job renames, and that a basename
           # match would not give: another repository's similarly named

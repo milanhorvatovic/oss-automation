@@ -853,6 +853,19 @@ jobs:
               fi
             fi
           fi
+          # The veto snapshot above predates the trust archaeology; a
+          # label landing meanwhile — its webhook possibly the dropped
+          # delivery this sweep covers — must be honored before any arm
+          # is certified or enabled.
+          if ! veto_now=$(gh pr view "$PR_NUMBER" --json labels --jq 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")'); then
+            echo "::error::Failed to re-read PR #${PR_NUMBER}'s labels after the trust check; refusing to mutate blind."
+            exit 1
+          fi
+          if [[ "$veto_now" == "true" ]]; then
+            echo "A veto label arrived during the trust check; enforcing the hold."
+            enforce_disarm "a veto label arrived during the trust check"
+            exit 0
+          fi
           # Deliberately after the trust check: an already-armed squash
           # PR must not be certified verified-armed — which feeds the
           # branch-update step — under an approval the check would have
@@ -1014,7 +1027,7 @@ jobs:
           fi
           gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
           for attempt in {1..6}; do
-            if ! state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
+            if ! state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid,labels); then
               echo "::error::Failed to read PR #${PR_NUMBER} inside the arm verification loop."
               # Same stance as the post-merge read failure: a known
               # non-squash arm whose pre-loop disable may not have
@@ -1052,6 +1065,13 @@ jobs:
             fi
             if [[ "$pr_state" == "CLOSED" ]]; then
               echo "PR is CLOSED; nothing to arm."
+              exit 0
+            fi
+            # Each retry re-checks the labels: an enable already issued
+            # must not survive a veto landing mid-loop.
+            if [[ "$(jq -r 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")' <<<"$state")" == "true" ]]; then
+              echo "A veto label arrived during the arm loop; enforcing the hold."
+              enforce_disarm "a veto label arrived during the arm loop"
               exit 0
             fi
             if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then

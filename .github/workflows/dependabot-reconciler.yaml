@@ -744,6 +744,11 @@ jobs:
             # head. An old-head App review under a fresh human approval
             # is inert and must not stall arming — under a
             # require-most-recent-push rule it stays APPROVED forever.
+            # A load-bearing approval from any OTHER bot is neither
+            # human nor re-drivable — the contract routes it to manual
+            # triage. Base retargets are covered upstream: the caller
+            # contract's `edited` trigger spawns a fresh policy run on
+            # the new base, which the newest-run read here honors.
             if ! reviews=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp --jq 'add // []'); then
               echo "::error::Failed to list PR #${PR_NUMBER}'s reviews before arming; refusing to mutate blind."
               exit 1
@@ -751,6 +756,12 @@ jobs:
             app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
             app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
             human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            foreign_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            foreign_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
+              echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no arming or recovery merge."
+              exit 0
+            fi
             if [[ "$app_head" != "0" || ( "$app_any" != "0" && "$human_head" == "0" ) ]]; then
               # Newest-first with the exactly-one PR association rule the
               # re-drive uses (a multi-PR head cannot attribute a run,
@@ -1119,6 +1130,15 @@ jobs:
             app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
             app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
             human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            foreign_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            foreign_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            # A load-bearing approval from any OTHER bot is neither
+            # human nor re-drivable — a policy rerun cannot dismiss it;
+            # per the contract it stays manual triage.
+            if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
+              echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no re-drive."
+              exit 0
+            fi
             if [[ "$app_head" == "0" && ( "$app_any" == "0" || "$human_head" != "0" ) ]]; then
               echo "The review requirements are satisfied by human review; nothing to re-drive."
               exit 0
@@ -1228,7 +1248,12 @@ jobs:
               # Compare against the PR's actual base branch, not the
               # default branch — Dependabot PRs can target non-default
               # branches, and it is the base's caller workflow whose
-              # tightening must not be bypassed by a re-run. Approximate
+              # tightening must not be bypassed by a re-run. A retarget
+              # that predates the sweep is covered upstream: the caller
+              # contract's `edited` trigger spawns a fresh policy run on
+              # the new base, which the newest-run walk targets instead
+              # of the frozen old-base run; a dropped edited delivery
+              # degrades to identical-blob approximation. Approximate
               # by necessity: a re-run executes the run-era merge-time
               # definition, which the API does not expose, so a base that
               # changed after the run and reverted since passes this

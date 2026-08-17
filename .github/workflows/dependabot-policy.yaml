@@ -1,10 +1,13 @@
 name: Dependabot Policy
 
 # Reusable tier engine for Dependabot PRs. Callers run on
-# pull_request [opened, reopened, synchronize, labeled, unlabeled], carry the
-# trust guards (Dependabot authorship, same-repo head) as top-level `if:`
-# conjuncts, and delegate here at a full commit SHA — this workflow never
-# re-checks authorship. The authorship guard must key on the PR author
+# pull_request [opened, reopened, synchronize, labeled, unlabeled,
+# edited], carry the trust guards (Dependabot authorship, same-repo
+# head) as top-level `if:` conjuncts, and delegate here at a full commit
+# SHA — this workflow never re-checks authorship. The `edited` type is
+# load-bearing, not cosmetic: a base retarget emits only `edited`, and
+# without it no policy run ever re-evaluates the PR under the new
+# base's caller configuration. The authorship guard must key on the PR author
 # (github.event.pull_request.user.login == 'dependabot[bot]'), never on
 # github.actor: the reconciler's branch updates emit synchronize events
 # whose actor is the App, and an actor-keyed guard would skip this

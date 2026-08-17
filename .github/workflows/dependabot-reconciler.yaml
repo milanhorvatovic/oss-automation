@@ -670,6 +670,32 @@ jobs:
           POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
+          # Detection without neutralization is not a stand-down: any
+          # path that discovers a hazardous approval over an existing
+          # arm must kill the merge vector, verified and MERGED-aware,
+          # before yielding — otherwise the worker merges while the
+          # rerun is still repairing policy.
+          enforce_disarm() {
+            local reason="$1"
+            if [[ "$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")" == "false" ]]; then
+              return 0
+            fi
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while being disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled (${reason}). Investigate immediately."
+              exit 1
+            fi
+            echo "Auto-merge confirmed disabled (${reason})."
+          }
           if ! live=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus,headRefOid); then
             echo "::error::Failed to re-read PR #${PR_NUMBER} before arming; refusing to mutate blind."
             exit 1
@@ -760,6 +786,7 @@ jobs:
             foreign_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
             if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
               echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no arming or recovery merge."
+              enforce_disarm "a bot approval this App cannot attribute may satisfy the review requirement"
               exit 0
             fi
             if [[ "$app_head" != "0" || ( "$app_any" != "0" && "$human_head" == "0" ) ]]; then
@@ -771,10 +798,11 @@ jobs:
               # while the re-drive honors the older green run would
               # leave the PR unarmed on every sweep.
               # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
-              trust_ids=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
-                --jq '(env.PR_NUMBER | tonumber) as $n | .[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | .id') || trust_ids=""
+              trust_rows=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
+                --jq '(env.PR_NUMBER | tonumber) as $n | .[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv') || trust_rows=""
               job_ok="false"
-              for trust_run in $trust_ids; do
+              while IFS=$'\t' read -r trust_run trust_path; do
+                [[ -n "$trust_run" ]] || continue
                 if ! trust_conclusion=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
                   --jq '[.[].jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""] | if length == 1 then .[0] else "ambiguous" end'); then
                   trust_conclusion="unreadable"
@@ -783,13 +811,27 @@ jobs:
                   continue
                 fi
                 if [[ "$trust_conclusion" == "success" ]]; then
-                  job_ok="true"
+                  # A green job validates the approval only under the
+                  # current caller configuration — the same blob-parity
+                  # rule the rerun path applies. A caller changed on the
+                  # base since (or a dropped retarget delivery) makes
+                  # this verdict obsolete; anything unreadable or
+                  # mismatched stays suspect.
+                  if trust_base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') \
+                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base" --jq '.sha') \
+                    && trust_head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$VERIFIED_HEAD" --jq '.sha') \
+                    && [[ "$trust_base_blob" == "$trust_head_blob" ]]; then
+                    job_ok="true"
+                  else
+                    echo "The green policy run's caller configuration cannot be confirmed current; treating the approval as suspect."
+                  fi
                 fi
                 break
-              done
+              done <<<"$trust_rows"
               if [[ "$job_ok" != "true" ]]; then
-                echo "::notice::PR #${PR_NUMBER}'s review requirement is satisfied by an App approval, but the newest policy job for the verified head is not confirmably green — the approval may be one a failed revocation could not dismiss. Standing down; the re-drive step re-runs policy to re-decide."
+                echo "::notice::PR #${PR_NUMBER}'s review requirement is satisfied by an App approval, but the newest policy job for the verified head is not confirmably green under the current caller — the approval may be one a failed revocation could not dismiss. Standing down; the re-drive step re-runs policy to re-decide."
                 echo "stale-approval-suspect=true" >> "$GITHUB_OUTPUT"
+                enforce_disarm "an App approval without a confirmably green policy job may satisfy the review requirement"
                 exit 0
               fi
             fi
@@ -1098,6 +1140,30 @@ jobs:
           POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
+          # Same stance as the arm step: a hazardous approval discovered
+          # over an existing arm is neutralized, verified and
+          # MERGED-aware, before this step yields or reruns.
+          enforce_disarm() {
+            local reason="$1"
+            if [[ "$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")" == "false" ]]; then
+              return 0
+            fi
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while being disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled (${reason}). Investigate immediately."
+              exit 1
+            fi
+            echo "Auto-merge confirmed disabled (${reason})."
+          }
           if [[ -z "${RERUN_TOKEN}" ]]; then
             echo "::notice::The App token could not be minted with Actions write; grant the App the Actions repository permission (read and write) in the calling repository to enable the approval re-drive."
             exit 0
@@ -1112,6 +1178,7 @@ jobs:
           # only when humans satisfied it: an App-satisfied decision can
           # be the approval a failed revocation could not dismiss, and
           # the run inspection below is what tells those apart.
+          suspect_live="false"
           if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
             echo "::warning::Failed to read the PR's review decision; leaving the re-drive to the next sweep."
             exit 0
@@ -1137,12 +1204,14 @@ jobs:
             # per the contract it stays manual triage.
             if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
               echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no re-drive."
+              enforce_disarm "a bot approval this App cannot attribute may satisfy the review requirement"
               exit 0
             fi
             if [[ "$app_head" == "0" && ( "$app_any" == "0" || "$human_head" != "0" ) ]]; then
               echo "The review requirements are satisfied by human review; nothing to re-drive."
               exit 0
             fi
+            suspect_live="true"
             echo "The review requirements are satisfied, but possibly by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
           fi
           # A policy-calling run is identified by its referenced_workflows
@@ -1243,7 +1312,7 @@ jobs:
               # update that emits no PR event) would make the re-run
               # apply obsolete rules, so re-drive only when the caller
               # workflow file is byte-identical between the verified head
-              # and the default branch; anything else waits for a fresh
+              # and the PR's base branch; anything else waits for a fresh
               # event under the current contract.
               # Compare against the PR's actual base branch, not the
               # default branch — Dependabot PRs can target non-default
@@ -1285,9 +1354,9 @@ jobs:
               # after the arm step's read would make this a stale-head
               # re-run that displaces the pending current-head policy
               # run in the shared single-slot group — and a base
-              # retarget emits only an `edited` event, none of the
-              # policy caller's triggers, so the parity just verified
-              # would belong to the old base.
+              # retarget's fresh `edited` policy run can itself be
+              # displaced from that slot, so the parity just verified
+              # could still belong to the old base.
               if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName); then
                 echo "::warning::Failed to re-read the PR before the re-run; leaving the re-drive to the next sweep."
                 exit 0
@@ -1301,6 +1370,12 @@ jobs:
               if [[ "$live_base" != "$base_ref" ]]; then
                 echo "The PR was retargeted (${base_ref} -> ${live_base}) after the caller parity check; leaving the re-drive to the next sweep."
                 exit 0
+              fi
+              # A possibly-stale App approval over a live arm would let
+              # the worker merge before the rerun repairs policy —
+              # neutralize it first.
+              if [[ "$suspect_live" == "true" ]]; then
+                enforce_disarm "a possibly-stale App approval satisfies the review requirement while policy is re-run"
               fi
               # The job-level rerun restores failed and cancelled jobs
               # alike and repeats only the policy job and its dependents

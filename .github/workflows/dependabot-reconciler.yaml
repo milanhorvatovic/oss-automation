@@ -725,11 +725,6 @@ jobs:
           merge_method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$live")
           merge_state=$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$live")
           echo "merge-state=${merge_state}" >> "$GITHUB_OUTPUT"
-          if [[ "$armed" == "true" && "$merge_method" == "SQUASH" && "$merge_state" != "CLEAN" ]]; then
-            echo "Squash auto-merge is armed and waiting on its requirements; nothing to reconcile."
-            echo "verified-armed=true" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
           # An App-satisfied review decision is trustworthy only against
           # a green policy job for this head: policy's fail-closed
           # revocation can leave an approval it could not dismiss (the
@@ -757,27 +752,45 @@ jobs:
             app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
             human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
             if [[ "$app_head" != "0" || ( "$app_any" != "0" && "$human_head" == "0" ) ]]; then
-              # Slurped so [0] picks the newest across pages (per-page it
-              # would emit one id per page), and the exactly-one PR
-              # association rule matches the re-drive's: a multi-PR head
-              # cannot attribute a run, and a green run for another PR
-              # must not validate this one's approval.
+              # Newest-first with the exactly-one PR association rule the
+              # re-drive uses (a multi-PR head cannot attribute a run,
+              # and a green run for another PR must not validate this
+              # one's approval), and the same walk-past-skipped rule: a
+              # veto-era skipped job is no verdict, and stopping on it
+              # while the re-drive honors the older green run would
+              # leave the PR unarmed on every sweep.
               # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
-              trust_run=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
-                --jq '(env.PR_NUMBER | tonumber) as $n | [.[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@")))][0].id // ""') || trust_run=""
+              trust_ids=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
+                --jq '(env.PR_NUMBER | tonumber) as $n | .[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | .id') || trust_ids=""
               job_ok="false"
-              if [[ -n "$trust_run" ]]; then
-                if ! job_ok=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
-                  --jq '[.[].jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""] | if length == 1 and .[0] == "success" then "true" else "false" end'); then
-                  job_ok="false"
+              for trust_run in $trust_ids; do
+                if ! trust_conclusion=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
+                  --jq '[.[].jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""] | if length == 1 then .[0] else "ambiguous" end'); then
+                  trust_conclusion="unreadable"
                 fi
-              fi
+                if [[ "$trust_conclusion" == "skipped" ]]; then
+                  continue
+                fi
+                if [[ "$trust_conclusion" == "success" ]]; then
+                  job_ok="true"
+                fi
+                break
+              done
               if [[ "$job_ok" != "true" ]]; then
                 echo "::notice::PR #${PR_NUMBER}'s review requirement is satisfied by an App approval, but the newest policy job for the verified head is not confirmably green — the approval may be one a failed revocation could not dismiss. Standing down; the re-drive step re-runs policy to re-decide."
                 echo "stale-approval-suspect=true" >> "$GITHUB_OUTPUT"
                 exit 0
               fi
             fi
+          fi
+          # Deliberately after the trust check: an already-armed squash
+          # PR must not be certified verified-armed — which feeds the
+          # branch-update step — under an approval the check would have
+          # stood down on.
+          if [[ "$armed" == "true" && "$merge_method" == "SQUASH" && "$merge_state" != "CLEAN" ]]; then
+            echo "Squash auto-merge is armed and waiting on its requirements; nothing to reconcile."
+            echo "verified-armed=true" >> "$GITHUB_OUTPUT"
+            exit 0
           fi
           # Any initially-observed non-squash arm is recorded regardless
           # of merge state: a MERGE/REBASE arm on a BLOCKED or UNSTABLE

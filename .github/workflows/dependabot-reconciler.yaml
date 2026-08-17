@@ -86,11 +86,12 @@ name: Dependabot Reconciler
 # The approve decision is never made here: deriving the update tier
 # needs dependabot/fetch-metadata, which reads the Dependabot PR event
 # context a cron run does not have. What the sweep can re-drive is the
-# decision's venue — re-running the newest failed or cancelled policy
-# run for the verified head: failures via rerun-failed-jobs so a
-# caller's green sibling jobs stay untouched, a cancelled run re-run
-# whole because the failed-jobs endpoint does not restore cancelled
-# jobs — and only after verifying the caller workflow file is unchanged
+# decision's venue — re-running the policy job of the newest failed or
+# cancelled policy run for the verified head (the job-level rerun
+# endpoint restores failed and cancelled jobs alike and repeats only
+# that job and its dependents, so a caller's unrelated jobs never
+# re-run their side effects) — and only after verifying the caller
+# workflow file is unchanged
 # between the run's head and the PR's base branch, because a re-run
 # executes the original definition and inputs, and approving under a
 # since-tightened privileged list or an outdated policy pin would apply
@@ -222,6 +223,12 @@ jobs:
       # One PR's failed reconciliation must not cancel the sweep over the
       # rest — each red is its own investigation.
       fail-fast: false
+      # All jobs share one App installation, and GitHub's secondary
+      # limits (100 concurrent requests, 900 REST points/minute, 80
+      # content-generating requests/minute) would let an uncapped
+      # 256-job sweep throttle itself into widespread transient
+      # failures.
+      max-parallel: 10
       matrix:
         pr: ${{ fromJSON(needs.plan.outputs.numbers) }}
     # Joins the policy workflow's per-PR group in the calling repository:
@@ -732,8 +739,12 @@ jobs:
             # the ruleset's jurisdiction — the worker this merge
             # re-fires never checked either.
             echo "PR #${PR_NUMBER} is verified and CLEAN yet open — a dropped merge fire; merging directly."
+            # The REST merge attributes success to this request — a 200
+            # means this call performed the squash, where the CLI can
+            # report a success it did not cause (an already-merged PR) —
+            # and the sha parameter pins it to the verified head.
             merge_rc=0
-            merge_output=$(gh pr merge --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1) || merge_rc=$?
+            merge_output=$(gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/merge" -f merge_method=squash -f sha="$VERIFIED_HEAD" 2>&1) || merge_rc=$?
             if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
               echo "::error::Failed to re-read PR #${PR_NUMBER} after the direct merge attempt."
               exit 1
@@ -1013,6 +1024,7 @@ jobs:
           # older: stand down and let it finish.
           target=""
           target_path=""
+          target_job_id=""
           conclusion=""
           while IFS=$'\t' read -r run_id run_path pr_count; do
             [[ -n "$run_id" ]] || continue
@@ -1028,8 +1040,8 @@ jobs:
               echo "Policy run ${run_id} is ${run_status}; leaving it to finish."
               exit 0
             fi
-            if ! job_conclusions=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}/jobs?per_page=100" --paginate \
-              --jq '.jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""'); then
+            if ! policy_jobs=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}/jobs?per_page=100" --paginate \
+              --jq '.jobs[] | select(.name | endswith(" / policy")) | [(.id | tostring), (.conclusion // "")] | @tsv'); then
               echo "::warning::Failed to inspect the jobs of policy run ${run_id}; leaving the re-drive to the next sweep."
               exit 0
             fi
@@ -1038,18 +1050,19 @@ jobs:
             # told from the other by display name alone, so conflicting
             # conclusions stand down to a human rather than letting an
             # unrelated job's result drive the re-run.
-            unique_conclusions=$(sort -u <<<"$job_conclusions" | sed '/^$/d')
+            unique_conclusions=$(cut -f2 <<<"$policy_jobs" | sort -u | sed '/^$/d')
             if [[ "$(wc -l <<<"$unique_conclusions" | tr -d ' ')" -gt 1 ]]; then
               echo "::notice::Run ${run_id} carries multiple policy-suffixed jobs with conflicting conclusions ($(tr '\n' ' ' <<<"$unique_conclusions")); ambiguous — leaving it for manual triage."
               exit 0
             fi
-            job_conclusion=$(sed -n '1p' <<<"$unique_conclusions")
+            IFS=$'\t' read -r policy_job_id job_conclusion <<<"$(sed -n '1p' <<<"$policy_jobs")"
             if [[ "$job_conclusion" == "skipped" ]]; then
               echo "The policy job in run ${run_id} was skipped (a veto-era payload); checking the next older run."
               continue
             fi
             target="$run_id"
             target_path="$run_path"
+            target_job_id="$policy_job_id"
             conclusion="$job_conclusion"
             break
           done <<<"$run_rows"
@@ -1101,9 +1114,6 @@ jobs:
                 echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
                 exit 0
               fi
-              # rerun-failed-jobs restores failed jobs only — a cancelled
-              # job is not failed, so a cancelled run (the concurrency
-              # displacement case) is re-run whole instead.
               # Last live check before the POST: a synchronize landing
               # after the arm step's read would make this a stale-head
               # re-run that displaces the pending current-head policy
@@ -1125,15 +1135,13 @@ jobs:
                 echo "The PR was retargeted (${base_ref} -> ${live_base}) after the caller parity check; leaving the re-drive to the next sweep."
                 exit 0
               fi
-              if [[ "$conclusion" == "cancelled" ]]; then
-                echo "Re-running cancelled policy run ${target} in full so policy re-decides the approve."
-                rerun_endpoint="repos/${GH_REPO}/actions/runs/${target}/rerun"
-              else
-                echo "Re-running the failed jobs of policy run ${target} (policy job: ${conclusion}) so policy re-decides the approve."
-                rerun_endpoint="repos/${GH_REPO}/actions/runs/${target}/rerun-failed-jobs"
-              fi
-              if ! GH_TOKEN="$RERUN_TOKEN" gh api -X POST "$rerun_endpoint"; then
-                echo "::warning::Could not re-run policy run ${target} (runs older than 30 days cannot be re-run); leaving the approval to the next sweep or a maintainer."
+              # The job-level rerun restores failed and cancelled jobs
+              # alike and repeats only the policy job and its dependents
+              # (the caller's gate), so unrelated caller jobs never
+              # re-run their side effects.
+              echo "Re-running the policy job of run ${target} (conclusion: ${conclusion}) so policy re-decides the approve."
+              if ! GH_TOKEN="$RERUN_TOKEN" gh api -X POST "repos/${GH_REPO}/actions/jobs/${target_job_id}/rerun"; then
+                echo "::warning::Could not re-run the policy job of run ${target} (runs older than 30 days cannot be re-run); leaving the approval to the next sweep or a maintainer."
               fi
               ;;
             *)

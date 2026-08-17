@@ -95,8 +95,13 @@ name: Dependabot Reconciler
 # between the run's head and the PR's base branch, because a re-run
 # executes the original definition and inputs, and approving under a
 # since-tightened privileged list or an outdated policy pin would apply
-# obsolete rules. That path needs the App's Actions repository
-# permission; without the grant the sweep skips it with a notice. A policy run that concluded green yet left no approval is
+# obsolete rules. An App-satisfied review decision is trusted nowhere
+# in the sweep without a confirmably green policy job for the verified
+# head: a failed revocation can leave an approval it could not dismiss,
+# and neither the arm step nor the recovery merge may restore the merge
+# vector that failure disarmed. That path needs the App's Actions
+# repository permission; without the grant the sweep skips it with a
+# notice. A policy run that concluded green yet left no approval is
 # deliberate — a held tier, or a fail-open approve skip — and stays with
 # a maintainer, as does a PR whose event delivery was lost so completely
 # that no run exists to re-run. After an off->on kill-switch flip the
@@ -643,8 +648,13 @@ jobs:
           steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          # The bot token carries no Actions scope; the trust check's two
+          # Actions reads use the default token, whose actions: read the
+          # permissions block grants.
+          ACTIONS_READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
+          POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
           if ! live=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus,headRefOid); then
@@ -706,6 +716,39 @@ jobs:
             echo "Squash auto-merge is armed and waiting on its requirements; nothing to reconcile."
             echo "verified-armed=true" >> "$GITHUB_OUTPUT"
             exit 0
+          fi
+          # An App-satisfied review decision is trustworthy only against
+          # a green policy job for this head: policy's fail-closed
+          # revocation can leave an approval it could not dismiss (the
+          # ruleset may restrict dismissals), and arming or merging
+          # under it would restore exactly the merge vector that failure
+          # disarmed. Suspect state stands down and hands the PR to the
+          # re-drive step, whose policy-job rerun re-decides — including
+          # re-trying the dismissal.
+          if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
+            echo "::error::Failed to read PR #${PR_NUMBER}'s review decision before arming; refusing to mutate blind."
+            exit 1
+          fi
+          if [[ "$decision" == "APPROVED" ]]; then
+            app_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' ')
+            if [[ "$app_approvals" != "0" ]]; then
+              # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
+              trust_run=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
+                --jq '(env.PR_NUMBER | tonumber) as $n | [.workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@")))][0].id // ""')
+              job_ok="false"
+              if [[ -n "$trust_run" ]]; then
+                if ! job_ok=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
+                  --jq '[.[].jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""] | if length == 1 and .[0] == "success" then "true" else "false" end'); then
+                  job_ok="false"
+                fi
+              fi
+              if [[ "$job_ok" != "true" ]]; then
+                echo "::notice::PR #${PR_NUMBER}'s review requirement is satisfied by an App approval, but the newest policy job for the verified head is not confirmably green — the approval may be one a failed revocation could not dismiss. Standing down; the re-drive step re-runs policy to re-decide."
+                echo "stale-approval-suspect=true" >> "$GITHUB_OUTPUT"
+                exit 0
+              fi
+            fi
           fi
           # Any initially-observed non-squash arm is recorded regardless
           # of merge state: a MERGE/REBASE arm on a BLOCKED or UNSTABLE
@@ -933,7 +976,8 @@ jobs:
       # instead of failing the job.
       - name: Mint a rerun-capable token
         id: rerun-token
-        if: steps.arm.outputs.verified-armed == 'true'
+        if: >-
+          steps.arm.outputs.verified-armed == 'true' || steps.arm.outputs.stale-approval-suspect == 'true'
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
@@ -954,8 +998,9 @@ jobs:
       # re-drive that cannot land grants nothing.
       - name: Re-drive a failed policy run for the missing approval
         if: >-
-          steps.arm.outputs.verified-armed == 'true' && steps.update.outputs.updated != 'true'
+          (steps.arm.outputs.verified-armed == 'true' && steps.update.outputs.updated != 'true') || steps.arm.outputs.stale-approval-suspect == 'true'
         env:
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
           # App token for the PR and contents reads (quota, as in the
           # authorship step); the Actions reads and the rerun POST use
           # RERUN_TOKEN — the only credential here carrying the Actions
@@ -976,14 +1021,22 @@ jobs:
           # and only the decision reflects what the merge actually
           # requires — the same read policy consults. A held PR reads
           # REVIEW_REQUIRED here and proceeds, and its green policy run
-          # below stands the re-drive down.
+          # below stands the re-drive down. APPROVED ends the re-drive
+          # only when humans satisfied it: an App-satisfied decision can
+          # be the approval a failed revocation could not dismiss, and
+          # the run inspection below is what tells those apart.
           if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
             echo "::warning::Failed to read the PR's review decision; leaving the re-drive to the next sweep."
             exit 0
           fi
           if [[ "$decision" == "APPROVED" ]]; then
-            echo "The review requirements are satisfied; nothing to re-drive."
-            exit 0
+            app_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' ')
+            if [[ "$app_approvals" == "0" ]]; then
+              echo "The review requirements are satisfied by human review; nothing to re-drive."
+              exit 0
+            fi
+            echo "The review requirements are satisfied, but by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
           fi
           # A policy-calling run is identified by its referenced_workflows
           # entry matching the policy-workflow input's full
@@ -1047,12 +1100,12 @@ jobs:
             fi
             # The " / policy" suffix could also match a different reusable
             # callee named policy inside the same run; one job cannot be
-            # told from the other by display name alone, so conflicting
-            # conclusions stand down to a human rather than letting an
-            # unrelated job's result drive the re-run.
-            unique_conclusions=$(cut -f2 <<<"$policy_jobs" | sort -u | sed '/^$/d')
-            if [[ "$(wc -l <<<"$unique_conclusions" | tr -d ' ')" -gt 1 ]]; then
-              echo "::notice::Run ${run_id} carries multiple policy-suffixed jobs with conflicting conclusions ($(tr '\n' ' ' <<<"$unique_conclusions")); ambiguous — leaving it for manual triage."
+            # told from the other by display name alone, and the
+            # job-level rerun needs one unambiguous job ID — so any
+            # multiple match stands down, agreeing conclusions included.
+            match_count=$(sed '/^$/d' <<<"$policy_jobs" | wc -l | tr -d ' ')
+            if [[ "$match_count" -gt 1 ]]; then
+              echo "::notice::Run ${run_id} carries ${match_count} policy-suffixed jobs; one cannot be told from another by display name, so the re-drive stands down for manual triage."
               exit 0
             fi
             IFS=$'\t' read -r policy_job_id job_conclusion <<<"$(sed -n '1p' <<<"$policy_jobs")"

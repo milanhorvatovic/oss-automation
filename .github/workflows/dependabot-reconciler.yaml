@@ -1,0 +1,1460 @@
+name: Dependabot Reconciler
+
+# Reusable cron sweep re-driving the Dependabot policy outcomes that PR
+# events alone cannot guarantee: webhook deliveries drop, armed auto-merge
+# fires stall, base branches advance under strict up-to-date checks with
+# no event on the PR, and the kill-switch variable flips without emitting
+# any PR event at all. Callers run on schedule (plus workflow_dispatch
+# for a manual sweep) and delegate here at a full commit SHA:
+#
+#   on:
+#     schedule:
+#       - cron: "*/30 * * * *"
+#     workflow_dispatch:
+#   concurrency:
+#     group: dependabot-reconciler
+#     cancel-in-progress: false
+#   jobs:
+#     reconcile:
+#       permissions:
+#         contents: read
+#         pull-requests: read
+#         actions: read
+#       uses: <owner>/oss-automation/.github/workflows/dependabot-reconciler.yaml@<sha>
+#       secrets:
+#         automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
+#         automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+#
+# The permissions block is required verbatim: a called workflow can only
+# downgrade the caller's token, never raise it, so on a repository or
+# org with a restricted default token an uncredentialed caller job fails
+# before a single step runs. The workflow-level concurrency block is
+# equally part of the contract: only the caller can serialize whole
+# sweeps (a called workflow's jobs cannot hold a group past their own
+# lifetime), and without it a slow sweep and the next cron tick run
+# duplicate matrices that double the eviction pressure inside the
+# per-PR groups. cancel-in-progress stays false so a running sweep is
+# never cancelled mid-mutation.
+#
+# No trust guards in the caller: nothing here runs from a PR event or
+# executes PR code, and every candidate PR is re-verified inside the
+# sweep. The only input is policy-workflow — the repository-qualified
+# identity of the policy workflow the re-drive may re-run, defaulting to
+# this repository's own; forks of the fleet home override it. No
+# privileged-dependencies input — that list gates only approval, and the
+# approve decision is never made here (see below).
+# Optional: granting the App the Actions repository permission (read and
+# write) enables the failed-policy-run re-drive; every other path works
+# without that grant. The policy caller's trust guards must key on the
+# PR author (github.event.pull_request.user.login), never on
+# github.actor — the branch updates this sweep performs emit synchronize
+# events whose actor is the App, and an actor-keyed guard would skip
+# policy on exactly the events this sweep exists to produce.
+#
+# Per open Dependabot PR (same-repo head), the sweep reconciles live
+# state to the policy workflow's own invariants:
+#
+#   live veto label       -> auto-merge disarmed (fail-closed verify)
+#   kill switch off       -> App approvals dismissed, App-armed
+#                            auto-merge disarmed; a maintainer's arm stays
+#   tampered commits      -> the same revocation, and no arm
+#   verified but unarmed  -> squash auto-merge armed; the arm criteria
+#                            are exactly policy's (no veto, verified
+#                            authorship, switch on) — the update tier
+#                            gates only approval, never the arm
+#   verified and BEHIND   -> branch updated onto base with the App token;
+#                            the resulting synchronize event re-drives
+#                            the policy workflow on the merged head
+#                            (whose authorship check whitelists the App's
+#                            update-branch merges)
+#   verified, CLEAN,      -> merged directly with the head pinned — a
+#   yet still open           dropped merge-worker fire; auto-merge
+#                            cannot be re-enabled on a clean PR, and a
+#                            wrong-method arm is disarmed first
+#   verified and armed,   -> the newest failed or cancelled policy run
+#   yet unapproved           for the verified head is re-run, so policy
+#                            itself re-decides the approve in its own
+#                            event context; a green prior run is never
+#                            re-run — its verdict stands
+#
+# Anything else — merge conflicts, drafts, bot approvals the App cannot
+# attribute — is left for manual triage, deliberately. Which humans may
+# approve is the ruleset's jurisdiction, here as under auto-merge: a
+# recovery merge fires because the ruleset's requirements are met, not
+# because of who met them.
+#
+# The approve decision is never made here: deriving the update tier
+# needs dependabot/fetch-metadata, which reads the Dependabot PR event
+# context a cron run does not have. What the sweep can re-drive is the
+# decision's venue — re-running the policy job of the newest failed or
+# cancelled policy run for the verified head (the job-level rerun
+# endpoint restores failed and cancelled jobs alike and repeats only
+# that job and its dependents, so a caller's unrelated jobs never
+# re-run their side effects) — and only after verifying the caller
+# workflow file is unchanged
+# between the run's head and the PR's base branch, because a re-run
+# executes the original definition and inputs, and approving under a
+# since-tightened privileged list or an outdated policy pin would apply
+# obsolete rules. An App-satisfied review decision is trusted nowhere
+# in the sweep without a confirmably green policy job for the verified
+# head: a failed revocation can leave an approval it could not dismiss,
+# and neither the arm step nor the recovery merge may restore the merge
+# vector that failure disarmed. That path needs the App's Actions
+# repository permission; without the grant the sweep skips it with a
+# notice. A policy run that concluded green yet left no approval is
+# deliberate — a held tier, or a fail-open approve skip — and stays with
+# a maintainer, as does a PR whose event delivery was lost so completely
+# that no run exists to re-run. After an off->on kill-switch flip the
+# sweep restores arming across open PRs; approvals follow by the same
+# re-run path or on each PR's next Dependabot event. A manual disarm
+# does not survive the sweep — the durable holds are the veto labels and
+# the kill switch, the same contract policy enforces on the next PR
+# event.
+#
+# Serialization: each per-PR job joins the same dependabot-policy-<n>
+# concurrency group the policy workflow uses in the calling repository,
+# so the sweep never mutates a PR concurrently with a policy run — and a
+# veto event's disarm-on-veto job may cancel an in-flight sweep job,
+# which is the veto winning. The group's single pending slot cuts both
+# ways: a sweep job arriving while a policy run executes can displace a
+# pending policy run (GitHub cancels it) — a cancelled policy run is
+# exactly what the re-drive step below re-runs, and policy's next event
+# re-derives everything regardless. Group order is not guaranteed, so
+# every mutation still reconciles against live state at run time,
+# policy's own rule.
+#
+# Schedule and workflow_dispatch events read the calling repository's
+# Actions secret store — the store the policy contract already requires
+# the App credential pair to be mirrored into.
+#
+# Checkout-free on purpose: PR code never executes here.
+
+on:
+  workflow_call:
+    inputs:
+      policy-workflow:
+        description: >-
+          Repository-qualified path of the policy reusable workflow whose
+          runs the approval re-drive may re-run. The referenced_workflows
+          entries this is matched against are repository-qualified, so a
+          basename alone would also match another repository's similarly
+          named workflow. Override only when the fleet home is a fork of
+          this repository.
+        required: false
+        type: string
+        default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
+    secrets:
+      automation-client-id:
+        description: Client ID of the GitHub App that arms and disarms.
+        required: true
+      automation-private-key:
+        description: Private key of the same GitHub App.
+        required: true
+
+permissions:
+  contents: read
+  pull-requests: read
+  # Locating the policy run to re-drive is a read; the re-run POST uses
+  # the App token, never this one.
+  actions: read
+
+jobs:
+  plan:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    # Covers only this job — a job group cannot outlive its job, so it
+    # cannot stop two sweeps' matrices from overlapping; whole-sweep
+    # serialization is the caller's workflow-level concurrency block,
+    # per the contract above. This group merely collapses redundant
+    # enumerations when the caller omits that block. Cancelling plan is
+    # safe — no mutation happens before the per-PR jobs.
+    concurrency:
+      group: dependabot-reconciler-plan
+      cancel-in-progress: true
+    outputs:
+      numbers: ${{ steps.enumerate.outputs.numbers }}
+    steps:
+      # Same sentinel as policy's: distinguishes "deliberately disabled"
+      # from "the variable not resolving in the caller". With the switch
+      # off the sweep still runs — it is the bounded-latency path that
+      # revokes stale approvals and arms across open PRs after a flip.
+      - name: Report auto-merge switch state
+        env:
+          ENABLED: ${{ vars.DEPENDABOT_AUTOMERGE_ENABLED }}
+        run: |
+          set -euo pipefail
+          enabled="${ENABLED:-}"
+          if [[ "${enabled,,}" == "true" ]]; then
+            echo "DEPENDABOT_AUTOMERGE_ENABLED=${ENABLED}; Dependabot autonomy is active."
+          else
+            echo "::notice::DEPENDABOT_AUTOMERGE_ENABLED is '${ENABLED:-<unset>}' (not 'true'); this sweep only revokes stale automation and enforces holds — no arming or branch updates."
+          fi
+
+      # REST is the enumeration source because its author login is the
+      # literal "dependabot[bot]" the policy authorship check keys on,
+      # and head.repo survives as null on a deleted fork (jq treats the
+      # null path as a non-match, exactly the exclusion wanted).
+      # Least-recently-updated first, so the matrix cap below rotates:
+      # every mutation bumps a PR's updated_at and moves it to the back
+      # of the window. Not an absolute guarantee — a front window of
+      # healthy PRs the sweep only reads keeps its order — but the
+      # excluded tail is then the recently-active PRs policy is
+      # likeliest to cover through their own events.
+      - name: Enumerate open Dependabot pull requests
+        id: enumerate
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          numbers=$(gh api "repos/${REPO}/pulls?state=open&per_page=100&sort=updated&direction=asc" --paginate \
+            --jq ".[] | select((.user.login == \"dependabot[bot]\") and (.head.repo.full_name == \"${REPO}\")) | .number" | jq -sc '.')
+          count=$(jq 'length' <<<"$numbers")
+          # 256 is the matrix-job ceiling; a silent slice would read as
+          # full coverage, so the cut is loud.
+          if (( count > 256 )); then
+            echo "::warning::${count} open Dependabot PRs exceed the 256-job matrix cap; reconciling the 256 least-recently-updated — mutations rotate the window, a fully-quiet window persists."
+            numbers=$(jq -c '.[:256]' <<<"$numbers")
+          fi
+          echo "Reconciling $(jq 'length' <<<"$numbers") of ${count} open Dependabot pull request(s)."
+          echo "numbers=${numbers}" >> "$GITHUB_OUTPUT"
+
+  reconcile:
+    needs: plan
+    if: needs.plan.outputs.numbers != '[]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      # One PR's failed reconciliation must not cancel the sweep over the
+      # rest — each red is its own investigation.
+      fail-fast: false
+      # All jobs share one App installation, and GitHub's secondary
+      # limits (100 concurrent requests, 900 REST points/minute, 80
+      # content-generating requests/minute) would let an uncapped
+      # 256-job sweep throttle itself into widespread transient
+      # failures.
+      max-parallel: 10
+      matrix:
+        pr: ${{ fromJSON(needs.plan.outputs.numbers) }}
+    # Joins the policy workflow's per-PR group in the calling repository:
+    # policy runs and sweep jobs for the same PR serialize, and
+    # disarm-on-veto (cancel-in-progress: true in that group) may cancel
+    # this job — the veto is the one preemptor, here as there.
+    concurrency:
+      group: dependabot-policy-${{ matrix.pr }}
+      cancel-in-progress: false
+    env:
+      # Step `if:` conditions cannot read the secrets context; surface the
+      # presence of the App credential here (a boolean, never the value).
+      AUTOMATION_SECRET_PRESENT: ${{ secrets.automation-client-id != '' }}
+      GH_REPO: ${{ github.repository }}
+      PR_NUMBER: ${{ matrix.pr }}
+    steps:
+      - name: Mint the automation-bot token
+        id: bot-token
+        if: env.AUTOMATION_SECRET_PRESENT == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.automation-client-id }}
+          private-key: ${{ secrets.automation-private-key }}
+          # Downscope from the App's full installation grant to what this
+          # job calls: auto-merge and update-branch live under contents.
+          permission-contents: write
+          permission-pull-requests: write
+
+      # The enumeration is minutes stale by now; this read is what the
+      # mutating steps trust. Refusing to continue on a failed read is
+      # policy's stance too — reconciling blind could disarm or arm
+      # against a state that no longer exists.
+      - name: Read live pull-request state
+        id: state
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! pr_json=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus); then
+            echo "::error::Failed to read the live state of PR #${PR_NUMBER}; refusing to reconcile it blind."
+            exit 1
+          fi
+          pr_state=$(jq -r '.state' <<<"$pr_json")
+          if [[ "$pr_state" != "OPEN" ]]; then
+            echo "PR #${PR_NUMBER} is ${pr_state} (raced the sweep); nothing to reconcile."
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "open=true" >> "$GITHUB_OUTPUT"
+          jq -r '
+            "veto=" + (any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required") | tostring),
+            "draft=" + (.isDraft | tostring),
+            "merge-state=" + (.mergeStateStatus // "UNKNOWN")
+          ' <<<"$pr_json" >> "$GITHUB_OUTPUT"
+          if [[ "$(jq -r '.isDraft' <<<"$pr_json")" == "true" ]]; then
+            echo "::notice::PR #${PR_NUMBER} is a draft — Dependabot never opens drafts, so this needs manual triage; hold enforcement still applies below."
+          fi
+
+      # Mirrors policy's veto handling: fail closed, and reconcile
+      # against live labels first — a sweep keyed on a stale veto must
+      # not be the final writer that disarms a re-armed PR after the veto
+      # lifted (policy's disarm-on-veto rule). A failed label query keeps
+      # the hold. Without credentials an armed PR under a live veto is a
+      # hard error — nothing can disarm it — while a bare veto with
+      # nothing armed passes quietly.
+      - name: Disarm under a live veto
+        if: steps.state.outputs.open == 'true' && steps.state.outputs.veto == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          if ! live_veto=$(gh pr view "$PR_NUMBER" --json labels --jq 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")'); then
+            echo "::warning::Failed to query the live veto-label state; assuming the hold stands."
+            live_veto="true"
+          fi
+          if [[ "$live_veto" != "true" ]]; then
+            echo "The veto label is no longer present; leaving auto-merge as it is."
+            exit 0
+          fi
+          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+            # A merged PR reads autoMergeRequest null too; the sentinel
+            # must not call the hold effective when the merge already
+            # fired.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less veto check."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged under a live veto label — the hold did not land. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$arm_info")" != "false" ]]; then
+              echo "::error::PR #${PR_NUMBER} carries a live veto label with auto-merge armed, and the App credential is empty so it cannot be disarmed. Restore the credentials or disarm manually."
+              exit 1
+            fi
+            echo "Live veto with nothing armed; the hold is effective without credentials."
+            exit 0
+          fi
+          gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+          # A merged PR also reads autoMergeRequest null, so the state
+          # must disambiguate: only an unmerged, unarmed PR confirms the
+          # hold landed — MERGED here means the prohibited merge fired
+          # mid-disarm.
+          if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+            echo "::error::Failed to verify the veto disarm on PR #${PR_NUMBER}."
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while the veto disarm was in flight — the hold did not land. Investigate immediately."
+            exit 1
+          fi
+          if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+            echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled under a live veto label. Investigate immediately."
+            exit 1
+          fi
+          echo "Auto-merge confirmed disabled under the live veto."
+
+      # The kill-switch flip emits no PR event; this sweep is where an
+      # off-flip lands with bounded latency. Same semantics as policy's
+      # revocation: dismiss the App's approvals, disarm the App-armed
+      # auto-merge, leave a maintainer's arm alone, and treat an
+      # unconfirmed revocation as a hard error. Vetoed PRs are NOT
+      # exempt — the veto disarm above only kills the arm, and a stale
+      # App approval must not outlive the flip to become effective again
+      # when the veto lifts or someone re-arms by hand. Without
+      # credentials the read-only sentinel separates a dormant
+      # repository (pass quietly) from stale bot automation nothing can
+      # revoke (fail red).
+      - name: Revoke stale automation while the switch is off
+        if: >-
+          steps.state.outputs.open == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+            bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
+            # A merged PR reads an empty armer too; the sentinel must
+            # not pass green when the automation it cannot revoke
+            # already completed the merge.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less sentinel."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged during the credential-less check — automation nothing can revoke may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
+            if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
+              echo "::error::A bot-authored approval or bot-armed auto-merge exists on PR #${PR_NUMBER}, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
+              exit 1
+            fi
+            echo "No bot approval or bot-armed auto-merge present; nothing to revoke."
+            exit 0
+          fi
+          list_active_approvals() {
+            gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id"
+          }
+          # This sweep is not a required check anywhere; before failing,
+          # kill the merge vector itself so the stale approval cannot
+          # complete a merge while the red run waits for a human.
+          fail_disarmed() {
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            # A merged PR also reads autoMergeRequest null; only an
+            # unmerged, unarmed PR counts as a landed disarm.
+            if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the revocation was failing — stale automation may have completed the merge. Investigate immediately."
+              elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::Auto-merge could not be confirmed disabled after a failed approval dismissal; the update may still merge unattended. Investigate immediately."
+              fi
+            else
+              echo "::error::Failed to verify the disarm after the failed revocation."
+            fi
+            exit 1
+          }
+          reason="the DEPENDABOT_AUTOMERGE_ENABLED kill switch is off"
+          if ! ids=$(list_active_approvals); then
+            echo "::error::Failed to list the App's active approvals on PR #${PR_NUMBER}."
+            fail_disarmed
+          fi
+          while read -r review_id; do
+            [[ -n "$review_id" ]] || continue
+            echo "Dismissing stale approval ${review_id} by ${BOT_LOGIN}."
+            if ! gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+              -f message="Dismissed by the Dependabot reconciler workflow: ${reason}."; then
+              echo "::error::Failed to dismiss stale approval ${review_id} by ${BOT_LOGIN}. If the calling repository's ruleset restricts who may dismiss reviews, add the App to that allow list."
+              fail_disarmed
+            fi
+          done <<<"$ids"
+          if ! remaining=$(list_active_approvals | wc -l | tr -d ' '); then
+            echo "::error::Failed to re-verify the App's active approvals after dismissal."
+            fail_disarmed
+          fi
+          if [[ "$remaining" != "0" ]]; then
+            echo "::error::A stale approval by ${BOT_LOGIN} is still active on PR #${PR_NUMBER}. Investigate immediately."
+            fail_disarmed
+          fi
+          if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+            echo "::error::Failed to query who armed auto-merge on the revocation path."
+            fail_disarmed
+          fi
+          # A merged PR reads autoMergeRequest null too — an empty armer
+          # must not be mistaken for nothing-to-disable when the merge
+          # won the race against the dismissals.
+          if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while its approvals were being dismissed (${reason}) — the revocation did not land. Investigate immediately."
+            exit 1
+          fi
+          armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
+          if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
+            echo "Disabling the App-armed auto-merge: ${reason}."
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm after the revocation (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while the revocation was in flight (${reason}) — stale automation may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled after the revocation (${reason}). Investigate immediately."
+              exit 1
+            fi
+          elif [[ -n "$armed_by" ]]; then
+            echo "Auto-merge was armed by ${armed_by}, not the App; leaving it in place."
+          fi
+
+      # Policy's tamper check, re-run against the sweep's own read of the
+      # PR — the arm below must rest on this run's verification, never on
+      # the arm having existed before. Same three-field rule: author is
+      # Dependabot or the App (its update-branch merges), committer is
+      # GitHub's web-flow, signature verified. Runs with or without App
+      # credentials — the read needs only GITHUB_TOKEN, and with none the
+      # App identity is unknown, so its update-branch merges
+      # conservatively count as tampered until credentials return,
+      # policy's own stance.
+      - name: Verify every commit is Dependabot's
+        id: authorship
+        if: >-
+          steps.state.outputs.open == 'true' && steps.state.outputs.veto == 'false' && steps.state.outputs.draft == 'false' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
+        env:
+          # App token preferred for quota: GITHUB_TOKEN's requests count
+          # against the repository-wide 1,000/hour pool shared by every
+          # workflow run, and a full 256-PR sweep's reads would drain it;
+          # the installation token has its own, larger pool. GITHUB_TOKEN
+          # stays as the credential-less fallback.
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+          APP_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          # A failed command substitution inside a here-string does not
+          # trip errexit, and an empty total would classify a healthy PR
+          # as tampered and revoke it — so this read is guarded
+          # explicitly, red on failure.
+          if ! details=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}" --jq '[.commits, .head.sha] | @tsv'); then
+            echo "::error::Failed to read PR #${PR_NUMBER}'s details for the tamper check; refusing to classify it blind."
+            exit 1
+          fi
+          # The commits endpoint returns at most 250 commits no matter the
+          # pagination, and appended commits sit at the end — an attacker
+          # could overflow the window to hide one from the check. Compare
+          # the enumerated count against the PR's true total and treat any
+          # shortfall as tampering.
+          IFS=$'\t' read -r total verified_head <<<"$details"
+          echo "verified-head=${verified_head}" >> "$GITHUB_OUTPUT"
+          listed=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq '.[].sha' | wc -l | tr -d ' ')
+          tampered=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/commits" --paginate \
+            --jq ".[] | select((((.author.login // \"\") != \"dependabot[bot]\") and ((.author.login // \"\") != \"${APP_LOGIN}\")) or ((.committer.login // \"\") != \"web-flow\") or (.commit.verification.verified != true)) | .sha" | wc -l | tr -d ' ')
+          if [[ "$listed" != "$total" || "$tampered" != "0" ]]; then
+            echo "::warning::Tamper check failed on PR #${PR_NUMBER}: ${tampered} unverifiable commit(s), enumerated ${listed} of ${total}. Treating the update as tampered — no arm, no branch update, and any existing App automation is revoked."
+            echo "dependabot-only=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "dependabot-only=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      # A tampered PR with no event since the tampering is exactly the
+      # dropped-delivery case this sweep exists for: policy never saw it,
+      # so its approval and arm are still live. Same revocation as the
+      # switch-off path, same fail-closed stance — including the
+      # credential-less sentinel: a tampered PR carrying bot automation
+      # nothing can revoke must go red, not pass green, so a consumer
+      # requiring the caller's gate context blocks the merge.
+      - name: Revoke automation on a tampered update
+        if: steps.authorship.outputs.dependabot-only == 'false'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+        run: |
+          set -euo pipefail
+          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+            bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
+            # A merged PR reads an empty armer too; the sentinel must
+            # not pass green when the automation it cannot revoke
+            # already completed the merge.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less sentinel."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged during the credential-less check — automation nothing can revoke may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
+            if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
+              echo "::error::PR #${PR_NUMBER} carries unverifiable commits alongside a bot approval or bot-armed auto-merge, and the automation-client-id secret is empty, so nothing can revoke it. Restore the App credentials or clean the PR up manually."
+              exit 1
+            fi
+            echo "Tampered update with no bot automation present; nothing to revoke without credentials."
+            exit 0
+          fi
+          list_active_approvals() {
+            gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
+              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id"
+          }
+          fail_disarmed() {
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            # A merged PR also reads autoMergeRequest null; only an
+            # unmerged, unarmed PR counts as a landed disarm.
+            if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::The tampered PR #${PR_NUMBER} merged while the revocation was failing. Investigate immediately."
+              elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::Auto-merge could not be confirmed disabled on the tampered update. Investigate immediately."
+              fi
+            else
+              echo "::error::Failed to verify the disarm on the tampered update."
+            fi
+            exit 1
+          }
+          reason="the pull request carries commits not verifiably authored by Dependabot"
+          if ! ids=$(list_active_approvals); then
+            echo "::error::Failed to list the App's active approvals on PR #${PR_NUMBER}."
+            fail_disarmed
+          fi
+          while read -r review_id; do
+            [[ -n "$review_id" ]] || continue
+            echo "Dismissing stale approval ${review_id} by ${BOT_LOGIN}."
+            if ! gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews/${review_id}/dismissals" \
+              -f message="Dismissed by the Dependabot reconciler workflow: ${reason}."; then
+              echo "::error::Failed to dismiss stale approval ${review_id} by ${BOT_LOGIN}. If the calling repository's ruleset restricts who may dismiss reviews, add the App to that allow list."
+              fail_disarmed
+            fi
+          done <<<"$ids"
+          if ! remaining=$(list_active_approvals | wc -l | tr -d ' '); then
+            echo "::error::Failed to re-verify the App's active approvals after dismissal."
+            fail_disarmed
+          fi
+          if [[ "$remaining" != "0" ]]; then
+            echo "::error::A stale approval by ${BOT_LOGIN} is still active on the tampered PR #${PR_NUMBER}. Investigate immediately."
+            fail_disarmed
+          fi
+          if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+            echo "::error::Failed to query who armed auto-merge on the revocation path."
+            fail_disarmed
+          fi
+          # A merged PR reads autoMergeRequest null too — an empty armer
+          # must not be mistaken for nothing-to-disable when the merge
+          # won the race against the dismissals.
+          if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+            echo "::error::PR #${PR_NUMBER} merged while its approvals were being dismissed (${reason}) — the revocation did not land. Investigate immediately."
+            exit 1
+          fi
+          armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
+          if [[ "$armed_by" == "$BOT_LOGIN" ]]; then
+            echo "Disabling the App-armed auto-merge: ${reason}."
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm after the tamper revocation."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::The tampered PR #${PR_NUMBER} merged while the revocation was in flight. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled after the tamper revocation. Investigate immediately."
+              exit 1
+            fi
+          elif [[ -n "$armed_by" ]]; then
+            echo "Auto-merge was armed by ${armed_by}, not the App; leaving it in place."
+          fi
+
+      # A verified PR the arm step cannot touch for lack of credentials
+      # is a misconfiguration, not dormancy: the kill switch being on
+      # declares automation wanted, and policy's own arm path fails red
+      # in the same state. Green-skipping here would silently leave the
+      # PR unreconciled forever.
+      - name: Fail on missing credentials with the switch on
+        if: >-
+          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT != 'true'
+        run: |
+          set -euo pipefail
+          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the automation-client-id secret is empty: PR #${PR_NUMBER} is verified and awaiting automation nothing can perform. Configure the App credentials or turn the kill switch off."
+          exit 1
+
+      # Restores policy's arm invariant on a verified PR: unarmed gets
+      # armed (a dropped opened-event delivery, an arm that failed red, or
+      # an off->on switch flip all land here), and a wrong-method arm is
+      # normalized to squash exactly as policy's arm step would. A CLEAN
+      # PR is the exception to arming: auto-merge cannot be enabled on a
+      # PR already in clean status, so a verified CLEAN PR — the dropped
+      # merge-worker case — is merged directly instead, branch protection
+      # still enforced server-side. A healthy arm (App or maintainer,
+      # squash, not CLEAN) is left untouched. The single live read below
+      # is the mutation authority — the state step's snapshot is stale by
+      # now — and the steps after this one trust the verified-armed
+      # output instead of re-deriving it. Unlike the branch-update and
+      # re-drive grants, exhausted arm retries go red on purpose —
+      # policy's own arm stance — because they signal repository or App
+      # misconfiguration (auto-merge or squash disabled, missing App
+      # write access), not a race a later sweep would win.
+      - name: Arm squash auto-merge
+        id: arm
+        if: >-
+          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT == 'true'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          # The bot token carries no Actions scope; the trust check's two
+          # Actions reads use the default token, whose actions: read the
+          # permissions block grants.
+          ACTIONS_READ_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+          VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
+          POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
+        run: |
+          set -euo pipefail
+          # Callers habitually write workflow identities with an @ref
+          # suffix; the referenced_workflows match needs the bare path,
+          # and an unstripped suffix would silently stand every lookup
+          # down.
+          POLICY_WORKFLOW="${POLICY_WORKFLOW%%@*}"
+          # Detection without neutralization is not a stand-down: any
+          # path that discovers a hazardous approval over an existing
+          # arm must kill the merge vector, verified and MERGED-aware,
+          # before yielding — otherwise the worker merges while the
+          # rerun is still repairing policy.
+          enforce_disarm() {
+            local reason="$1"
+            local pre
+            # A merged PR reads autoMergeRequest null too — an unarmed
+            # early return must first prove the hazardous approval did
+            # not already win the race.
+            if ! pre=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state before the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$pre")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged before it could be disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$pre")" == "false" ]]; then
+              return 0
+            fi
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while being disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled (${reason}). Investigate immediately."
+              exit 1
+            fi
+            echo "Auto-merge confirmed disabled (${reason})."
+          }
+          if ! live=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus,headRefOid); then
+            echo "::error::Failed to re-read PR #${PR_NUMBER} before arming; refusing to mutate blind."
+            exit 1
+          fi
+          pr_state=$(jq -r '.state' <<<"$live")
+          if [[ "$pr_state" != "OPEN" ]]; then
+            echo "PR is ${pr_state}; nothing to arm."
+            exit 0
+          fi
+          # The snapshot gated drafts, but a conversion can land since:
+          # an unarmed draft cannot be armed (red noise), and an armed
+          # draft must not be certified verified-armed for the steps
+          # downstream — drafts stay manual triage, as documented.
+          if [[ "$(jq -r '.isDraft' <<<"$live")" == "true" ]]; then
+            echo "PR #${PR_NUMBER} became a draft after the sweep's read; leaving it for manual triage."
+            exit 0
+          fi
+          has_veto=$(jq -r 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")' <<<"$live")
+          if [[ "$has_veto" == "true" ]]; then
+            # The label event behind this veto may itself be a dropped
+            # delivery — the disarm-on-veto run that should enforce the
+            # hold may never come, so enforce it here instead of only
+            # refusing to arm.
+            echo "A veto label arrived after the sweep's read; refusing to arm and enforcing the hold now."
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$live")" != "false" ]]; then
+              gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+              if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                echo "::error::Failed to verify the veto disarm on PR #${PR_NUMBER}."
+                exit 1
+              fi
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the veto disarm was in flight — the hold did not land. Investigate immediately."
+                exit 1
+              fi
+              if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled under a live veto label. Investigate immediately."
+                exit 1
+              fi
+              echo "Auto-merge confirmed disabled under the live veto."
+            fi
+            exit 0
+          fi
+          # Arming a head the tamper check never saw would hand auto-merge
+          # to unverified content; a moved head means a synchronize event
+          # is in flight and its policy run owns the new head.
+          current_head=$(jq -r '.headRefOid' <<<"$live")
+          if [[ "$current_head" != "$VERIFIED_HEAD" ]]; then
+            echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${current_head}); leaving arming to that event's policy run."
+            exit 0
+          fi
+          armed=$(jq -r '.autoMergeRequest != null' <<<"$live")
+          armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$live")
+          merge_method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$live")
+          merge_state=$(jq -r '.mergeStateStatus // "UNKNOWN"' <<<"$live")
+          echo "merge-state=${merge_state}" >> "$GITHUB_OUTPUT"
+          # An App-satisfied review decision is trustworthy only against
+          # a green policy job for this head: policy's fail-closed
+          # revocation can leave an approval it could not dismiss (the
+          # ruleset may restrict dismissals), and arming or merging
+          # under it would restore exactly the merge vector that failure
+          # disarmed. Suspect state stands down and hands the PR to the
+          # re-drive step, whose policy-job rerun re-decides — including
+          # re-trying the dismissal.
+          if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
+            echo "::error::Failed to read PR #${PR_NUMBER}'s review decision before arming; refusing to mutate blind."
+            exit 1
+          fi
+          if [[ "$decision" == "APPROVED" ]]; then
+            # Suspect only when the App's approval can be what satisfies
+            # the decision: an App approval pinned to the verified head,
+            # or any App approval with no human approval on the current
+            # head. An old-head App review under a fresh human approval
+            # is inert and must not stall arming — under a
+            # require-most-recent-push rule it stays APPROVED forever.
+            # A load-bearing approval from any OTHER bot is neither
+            # human nor re-drivable — the contract routes it to manual
+            # triage. Base retargets are covered upstream: the caller
+            # contract's `edited` trigger spawns a fresh policy run on
+            # the new base, which the newest-run read here honors.
+            if ! reviews=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp --jq 'add // []'); then
+              echo "::error::Failed to list PR #${PR_NUMBER}'s reviews before arming; refusing to mutate blind."
+              exit 1
+            fi
+            app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
+            app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
+            human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            foreign_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            foreign_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
+              echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no arming or recovery merge."
+              enforce_disarm "a bot approval this App cannot attribute may satisfy the review requirement"
+              exit 0
+            fi
+            if [[ "$app_head" != "0" || ( "$app_any" != "0" && "$human_head" == "0" ) ]]; then
+              # Newest-first with the exactly-one PR association rule the
+              # re-drive uses (a multi-PR head cannot attribute a run,
+              # and a green run for another PR must not validate this
+              # one's approval), and the same walk-past-skipped rule: a
+              # veto-era skipped job is no verdict, and stopping on it
+              # while the re-drive honors the older green run would
+              # leave the PR unarmed on every sweep.
+              # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
+              trust_rows=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
+                --jq '(env.PR_NUMBER | tonumber) as $n | .[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv') || trust_rows=""
+              job_ok="false"
+              while IFS=$'\t' read -r trust_run trust_path; do
+                [[ -n "$trust_run" ]] || continue
+                if ! trust_conclusion=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
+                  --jq '[.[].jobs[] | select(.name | endswith(" / policy")) | .conclusion // ""] | if length == 1 then .[0] else "ambiguous" end'); then
+                  trust_conclusion="unreadable"
+                fi
+                if [[ "$trust_conclusion" == "skipped" ]]; then
+                  continue
+                fi
+                if [[ "$trust_conclusion" == "success" ]]; then
+                  # A green job validates the approval only under the
+                  # current caller configuration — the same blob-parity
+                  # rule the rerun path applies. A caller changed on the
+                  # base since (or a dropped retarget delivery) makes
+                  # this verdict obsolete; anything unreadable or
+                  # mismatched stays suspect.
+                  if trust_base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') \
+                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base" --jq '.sha') \
+                    && trust_head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$VERIFIED_HEAD" --jq '.sha') \
+                    && [[ "$trust_base_blob" == "$trust_head_blob" ]]; then
+                    job_ok="true"
+                  else
+                    echo "The green policy run's caller configuration cannot be confirmed current; treating the approval as suspect."
+                  fi
+                fi
+                break
+              done <<<"$trust_rows"
+              if [[ "$job_ok" != "true" ]]; then
+                echo "::notice::PR #${PR_NUMBER}'s review requirement is satisfied by an App approval, but the newest policy job for the verified head is not confirmably green under the current caller — the approval may be one a failed revocation could not dismiss. Standing down; the re-drive step re-runs policy to re-decide."
+                echo "stale-approval-suspect=true" >> "$GITHUB_OUTPUT"
+                enforce_disarm "an App approval without a confirmably green policy job may satisfy the review requirement"
+                exit 0
+              fi
+            fi
+          fi
+          # The veto snapshot above predates the trust archaeology; a
+          # label landing meanwhile — its webhook possibly the dropped
+          # delivery this sweep covers — must be honored before any arm
+          # is certified or enabled.
+          if ! veto_now=$(gh pr view "$PR_NUMBER" --json labels --jq 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")'); then
+            echo "::error::Failed to re-read PR #${PR_NUMBER}'s labels after the trust check; refusing to mutate blind."
+            exit 1
+          fi
+          if [[ "$veto_now" == "true" ]]; then
+            echo "A veto label arrived during the trust check; enforcing the hold."
+            enforce_disarm "a veto label arrived during the trust check"
+            exit 0
+          fi
+          # Deliberately after the trust check: an already-armed squash
+          # PR must not be certified verified-armed — which feeds the
+          # branch-update step — under an approval the check would have
+          # stood down on.
+          if [[ "$armed" == "true" && "$merge_method" == "SQUASH" && "$merge_state" != "CLEAN" ]]; then
+            echo "Squash auto-merge is armed and waiting on its requirements; nothing to reconcile."
+            echo "verified-armed=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # Any initially-observed non-squash arm is recorded regardless
+          # of merge state: a MERGE/REBASE arm on a BLOCKED or UNSTABLE
+          # snapshot can fire before the loop's first read, and the
+          # MERGED checks below must know the method was never confirmed.
+          wrong_method_arm="false"
+          if [[ "$armed" == "true" && -n "$merge_method" && "$merge_method" != "SQUASH" ]]; then
+            wrong_method_arm="true"
+          fi
+          if [[ "$merge_state" == "CLEAN" && "$armed" == "true" && "$merge_method" != "SQUASH" ]]; then
+            # The squash contract must decide this merge, not the
+            # wrong-method arm the worker is about to fire — same
+            # normalization policy's arm step applies, regardless of who
+            # armed it. The disarm may race the worker; the direct squash
+            # merge below is the recovery, and the MERGED post-check
+            # refuses to pass green unless this run's own squash request
+            # is what won.
+            echo "Auto-merge is armed with ${merge_method} by ${armed_by} on a CLEAN PR; disarming so the squash contract decides the merge."
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+          fi
+          if [[ "$merge_state" == "CLEAN" ]]; then
+            # Enabling auto-merge on a clean-status PR is rejected by
+            # GitHub, so a toggle can never re-queue the worker — it
+            # would only strip the arm. The PR passed this run's tamper,
+            # veto, and head checks; merge it directly, pinned to the
+            # verified head so a racing push turns the merge into a
+            # refused no-op, and leave any existing squash arm in place
+            # the whole time. Approval provenance is deliberately not
+            # re-checked: CLEAN means the ruleset's requirements are
+            # satisfied, and which authorized reviewer satisfied them is
+            # the ruleset's jurisdiction — the worker this merge
+            # re-fires never checked either.
+            echo "PR #${PR_NUMBER} is verified and CLEAN yet open — a dropped merge fire; merging directly."
+            # The trust archaeology above takes long enough for a veto
+            # to land, and its webhook may be the dropped delivery this
+            # sweep exists to cover — an irreversible merge re-reads the
+            # labels at the last moment, because the sha pin guards the
+            # head, not the label state.
+            if ! last_veto=$(gh pr view "$PR_NUMBER" --json labels --jq 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")'); then
+              echo "::error::Failed to re-read PR #${PR_NUMBER}'s labels before the recovery merge; refusing to merge blind."
+              exit 1
+            fi
+            if [[ "$last_veto" == "true" ]]; then
+              echo "A veto label arrived before the recovery merge; enforcing the hold instead."
+              enforce_disarm "a veto label arrived before the recovery merge"
+              exit 0
+            fi
+            # The REST merge attributes success to this request — a 200
+            # means this call performed the squash, where the CLI can
+            # report a success it did not cause (an already-merged PR) —
+            # and the sha parameter pins it to the verified head.
+            merge_rc=0
+            merge_output=$(gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/merge" -f merge_method=squash -f sha="$VERIFIED_HEAD" 2>&1) || merge_rc=$?
+            if ! post=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
+              echo "::error::Failed to re-read PR #${PR_NUMBER} after the direct merge attempt."
+              # A known non-squash arm must not outlive this failure
+              # path: disable and verify before going red, and surface a
+              # merge that raced the disarm.
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+                if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                  if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                    echo "::error::PR #${PR_NUMBER} merged while the non-squash arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit."
+                  elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                    echo "::error::A non-squash auto-merge may remain armed; it could merge with the forbidden method. Investigate immediately."
+                  else
+                    echo "The non-squash arm is confirmed disabled despite the failed read."
+                  fi
+                else
+                  echo "::error::Could not verify the non-squash arm's disarm after the failed read. Investigate immediately."
+                fi
+              fi
+              exit 1
+            fi
+            post_state=$(jq -r '.state' <<<"$post")
+            post_method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$post")
+            post_head=$(jq -r '.headRefOid' <<<"$post")
+            if [[ "$post_state" == "MERGED" ]]; then
+              # MERGED alone is not success when a wrong-method arm was in
+              # play: the worker may have fired with the forbidden method
+              # between the best-effort disarm and this run's squash
+              # request. Only this run's own successful squash confirms
+              # the contract held.
+              if [[ "$merge_rc" -eq 0 || "$wrong_method_arm" != "true" ]]; then
+                echo "PR is MERGED."
+                exit 0
+              fi
+              echo "::error::PR #${PR_NUMBER} merged, but not by this run's squash request while a ${merge_method} arm was failing to disarm — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings to make this race unrepresentable."
+              exit 1
+            fi
+            if [[ "$post_state" == "CLOSED" ]]; then
+              echo "PR is CLOSED; nothing to merge."
+              exit 0
+            fi
+            # The head check precedes the surviving-arm check on purpose:
+            # a push racing the pinned merge leaves the old arm in place
+            # over a head this run never verified, and emitting
+            # verified-armed for it would key the update and re-drive
+            # steps to a stale head — that event's policy run owns it.
+            if [[ "$post_head" != "$VERIFIED_HEAD" ]]; then
+              echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${post_head}); the pinned merge refused correctly, and that event's policy run owns the new head."
+              exit 0
+            fi
+            if [[ "$post_method" == "SQUASH" ]]; then
+              echo "::warning::The direct merge did not land (${merge_output}); squash auto-merge remains armed for the worker."
+              echo "verified-armed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            # A surviving wrong-method arm on this failure path means the
+            # earlier disarm did not land; a red job alone would not stop
+            # the worker from merging with the forbidden method, so kill
+            # the merge vector and verify before exiting — policy's
+            # fail-disarmed stance.
+            if [[ -n "$post_method" ]]; then
+              gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+              if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                echo "::error::Failed to verify the disarm of the ${post_method} arm on the CLEAN PR."
+                exit 1
+              fi
+              if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while the ${post_method} arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings."
+                exit 1
+              fi
+              if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                echo "::error::A ${post_method} auto-merge remains armed on the CLEAN PR after a failed disarm; it may merge with the forbidden method. Investigate immediately."
+                exit 1
+              fi
+              echo "The ${post_method} arm is confirmed disabled; the merge waits for a maintainer."
+            fi
+            echo "::error::PR #${PR_NUMBER} reports CLEAN but the direct merge failed and no squash auto-merge is armed: ${merge_output}"
+            exit 1
+          fi
+
+          # `gh pr merge --auto` exits non-zero for benign reasons (already
+          # armed, already merged); the verification loop below is the
+          # authoritative check, not this call's exit code. Armed alone is
+          # not success: the squash contract holds only when the verified
+          # method is SQUASH, so a wrong-method arm is disabled and
+          # re-armed. Every enable — initial and retries — is pinned to
+          # the verified head, so a synchronize landing mid-loop makes
+          # the enable refuse instead of arming content the tamper check
+          # never inspected; the loop's own head read stands the run down
+          # the moment the head moves.
+          if [[ "$wrong_method_arm" == "true" ]]; then
+            # Normalize before the first enable, so no failure path in
+            # the loop below can exit with the observed non-squash arm
+            # still live — a red job would not stop that arm from
+            # merging with the forbidden method later.
+            echo "Auto-merge is armed with ${merge_method}; disarming before the squash enable."
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+          fi
+          gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
+          for attempt in {1..6}; do
+            if ! state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid,labels); then
+              echo "::error::Failed to read PR #${PR_NUMBER} inside the arm verification loop."
+              # Same stance as the post-merge read failure: a known
+              # non-squash arm whose pre-loop disable may not have
+              # landed must not outlive a transient read failure.
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+                if verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+                  if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+                    echo "::error::PR #${PR_NUMBER} merged while the non-squash arm was being disarmed — the merge method cannot be confirmed as squash. Inspect the merge commit."
+                  elif [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+                    echo "::error::A non-squash auto-merge may remain armed; it could merge with the forbidden method. Investigate immediately."
+                  else
+                    echo "The non-squash arm is confirmed disabled despite the failed read."
+                  fi
+                else
+                  echo "::error::Could not verify the non-squash arm's disarm after the failed read. Investigate immediately."
+                fi
+              fi
+              exit 1
+            fi
+            pr_state=$(jq -r '.state' <<<"$state")
+            method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$state")
+            live_head=$(jq -r '.headRefOid' <<<"$state")
+            # A wrong-method arm can win from BLOCKED or UNSTABLE too —
+            # its last requirement can complete between the snapshot and
+            # the normalization disable — so MERGED counts as success
+            # only when no non-squash arm was observed on the way here.
+            if [[ "$pr_state" == "MERGED" ]]; then
+              if [[ "$wrong_method_arm" == "true" ]]; then
+                echo "::error::PR #${PR_NUMBER} merged while a non-squash arm was being normalized — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings to make this race unrepresentable."
+                exit 1
+              fi
+              echo "PR is MERGED; nothing to arm."
+              exit 0
+            fi
+            if [[ "$pr_state" == "CLOSED" ]]; then
+              echo "PR is CLOSED; nothing to arm."
+              exit 0
+            fi
+            # Each retry re-checks the labels: an enable already issued
+            # must not survive a veto landing mid-loop.
+            if [[ "$(jq -r 'any(.labels[]; (.name | ascii_downcase) == "trust-boundary" or (.name | ascii_downcase) == "security-review-required")' <<<"$state")" == "true" ]]; then
+              echo "A veto label arrived during the arm loop; enforcing the hold."
+              enforce_disarm "a veto label arrived during the arm loop"
+              exit 0
+            fi
+            if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
+              echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); leaving arming to that event's policy run."
+              exit 0
+            fi
+            if [[ "$method" == "SQUASH" ]]; then
+              echo "Squash auto-merge is armed."
+              echo "verified-armed=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+            if [[ "$attempt" -eq 6 ]]; then
+              break
+            fi
+            if [[ -n "$method" ]]; then
+              echo "Auto-merge is armed with ${method}; re-arming with squash."
+              wrong_method_arm="true"
+              gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            else
+              echo "Auto-merge is not armed yet; retrying the enable."
+            fi
+            gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
+            sleep 2
+          done
+
+          # The retry limit must not leave an observed wrong-method arm
+          # live behind a red job — kill the merge vector and verify
+          # (including a merge racing the disarm) before exiting.
+          if [[ -n "$method" && "$method" != "SQUASH" ]]; then
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm of the ${method} arm after exhausting the arm retries."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while the ${method} arm was being disarmed after exhausted retries — the merge method cannot be confirmed as squash. Inspect the merge commit, and disable non-squash merge methods in the repository settings."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::A ${method} auto-merge remains armed after exhausted arm retries; it may merge with the forbidden method. Investigate immediately."
+              exit 1
+            fi
+            echo "The ${method} arm is confirmed disabled; the merge waits for a maintainer."
+          fi
+          echo "::error::PR #${PR_NUMBER} remains open without verified squash auto-merge. Confirm Allow auto-merge and squash merging are enabled in the calling repository and the App installation has Contents and Pull requests write access."
+          exit 1
+
+      # A base that advanced under a required up-to-date rule leaves the
+      # PR BEHIND with no event of its own — armed auto-merge waits
+      # forever. The App-token update produces the merge commit policy's
+      # authorship check whitelists, and the synchronize event it emits
+      # re-runs policy on the merged head (its run queues behind this job
+      # in the shared group, so re-approval of a dismissed review follows
+      # without a race). Gated on the arm step's verified output and its
+      # live merge-state read, so a stood-down arm — late veto, moved
+      # head — never precedes a branch update. Fail-open: an update that
+      # cannot land grants nothing, so it warns for the next sweep or a
+      # human instead of going red.
+      - name: Update the branch behind its base
+        id: update
+        if: >-
+          steps.arm.outputs.verified-armed == 'true' && steps.arm.outputs.merge-state == 'BEHIND'
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
+        run: |
+          set -euo pipefail
+          # expected_head_sha pins the update to the verified head — a
+          # concurrent push turns this into a refused no-op instead of an
+          # update of unseen commits.
+          if ! response=$(gh api -X PUT "repos/${GH_REPO}/pulls/${PR_NUMBER}/update-branch" \
+            -f expected_head_sha="$VERIFIED_HEAD" 2>&1); then
+            echo "::warning::Could not update PR #${PR_NUMBER} onto its base (the head moved, or the update cannot merge cleanly); leaving it to the next sweep or manual triage. ${response}"
+            exit 0
+          fi
+          echo "updated=true" >> "$GITHUB_OUTPUT"
+          echo "Branch update accepted; the synchronize event re-drives the policy workflow on the merged head."
+
+      # Separate mint because the Actions permission is optional: a
+      # consumer that never granted it must keep every other reconcile
+      # path, so a failed mint degrades the re-drive step to a notice
+      # instead of failing the job.
+      - name: Mint a rerun-capable token
+        id: rerun-token
+        if: >-
+          steps.arm.outputs.verified-armed == 'true' || steps.arm.outputs.stale-approval-suspect == 'true'
+        continue-on-error: true
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.automation-client-id }}
+          private-key: ${{ secrets.automation-private-key }}
+          permission-actions: write
+
+      # An eligible PR left armed-but-unapproved by a displaced, failed,
+      # or cancelled policy run would wait on a human indefinitely. The
+      # fix is to re-run that run, never to approve here: its event
+      # payload still carries the Dependabot context fetch-metadata
+      # needs, so policy re-derives the tier and re-decides the approve
+      # itself. Skipped when the branch update just fired — the
+      # synchronize event it emitted supersedes every run on the old
+      # head. A green prior run is never re-run: no approval after green
+      # is policy's own verdict (a held tier, or a fail-open approve
+      # skip) and stays with a maintainer. Fail-open throughout — a
+      # re-drive that cannot land grants nothing.
+      - name: Re-drive a failed policy run for the missing approval
+        if: >-
+          (steps.arm.outputs.verified-armed == 'true' && steps.update.outputs.updated != 'true') || steps.arm.outputs.stale-approval-suspect == 'true'
+        env:
+          BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
+          # App token for the PR and contents reads (quota, as in the
+          # authorship step); the Actions reads and the rerun POST use
+          # RERUN_TOKEN — the only credential here carrying the Actions
+          # scope.
+          GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+          RERUN_TOKEN: ${{ steps.rerun-token.outputs.token }}
+          VERIFIED_HEAD: ${{ steps.authorship.outputs.verified-head }}
+          POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
+        run: |
+          set -euo pipefail
+          # Callers habitually write workflow identities with an @ref
+          # suffix; the referenced_workflows match needs the bare path,
+          # and an unstripped suffix would silently stand every lookup
+          # down.
+          POLICY_WORKFLOW="${POLICY_WORKFLOW%%@*}"
+          # Same stance as the arm step: a hazardous approval discovered
+          # over an existing arm is neutralized, verified and
+          # MERGED-aware, before this step yields or reruns.
+          enforce_disarm() {
+            local reason="$1"
+            local pre
+            # A merged PR reads autoMergeRequest null too — an unarmed
+            # early return must first prove the hazardous approval did
+            # not already win the race.
+            if ! pre=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state before the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$pre")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged before it could be disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$pre")" == "false" ]]; then
+              return 0
+            fi
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+            local verify
+            if ! verify=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to verify the disarm (${reason})."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged while being disarmed (${reason}). Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
+              echo "::error::Auto-merge on PR #${PR_NUMBER} is still enabled (${reason}). Investigate immediately."
+              exit 1
+            fi
+            echo "Auto-merge confirmed disabled (${reason})."
+          }
+          if [[ -z "${RERUN_TOKEN}" ]]; then
+            echo "::notice::The App token could not be minted with Actions write; grant the App the Actions repository permission (read and write) in the calling repository to enable the approval re-drive."
+            exit 0
+          fi
+          # The live review decision, not a count of App approvals, is
+          # the gate: under a require-approval-of-most-recent-push rule
+          # an older review stays APPROVED without satisfying anything,
+          # and only the decision reflects what the merge actually
+          # requires — the same read policy consults. A held PR reads
+          # REVIEW_REQUIRED here and proceeds, and its green policy run
+          # below stands the re-drive down. APPROVED ends the re-drive
+          # only when humans satisfied it: an App-satisfied decision can
+          # be the approval a failed revocation could not dismiss, and
+          # the run inspection below is what tells those apart.
+          suspect_live="false"
+          if ! decision=$(gh pr view "$PR_NUMBER" --json reviewDecision --jq '.reviewDecision // ""'); then
+            echo "::warning::Failed to read the PR's review decision; leaving the re-drive to the next sweep."
+            exit 0
+          fi
+          if [[ "$decision" == "APPROVED" ]]; then
+            # Same suspect predicate as the arm step: an App approval on
+            # the verified head, or any App approval with no human
+            # approval on the current head, keeps the archaeology going;
+            # an inert old-head App review under a fresh human approval
+            # exits here instead of stalling on a missing rerun token or
+            # eligible run.
+            if ! reviews=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp --jq 'add // []'); then
+              echo "::warning::Failed to list the PR's reviews; leaving the re-drive to the next sweep."
+              exit 0
+            fi
+            app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
+            app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
+            human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            foreign_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            foreign_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .user.login != $b and (.user.login | endswith("[bot]")))] | length' <<<"$reviews")
+            # A load-bearing approval from any OTHER bot is neither
+            # human nor re-drivable — a policy rerun cannot dismiss it;
+            # per the contract it stays manual triage.
+            if [[ "$foreign_head" != "0" || ( "$foreign_any" != "0" && "$human_head" == "0" ) ]]; then
+              echo "::notice::PR #${PR_NUMBER}'s review decision may be satisfied by a bot approval this App cannot attribute; per the contract this stays manual triage — no re-drive."
+              enforce_disarm "a bot approval this App cannot attribute may satisfy the review requirement"
+              exit 0
+            fi
+            if [[ "$app_head" == "0" && ( "$app_any" == "0" || "$human_head" != "0" ) ]]; then
+              echo "The review requirements are satisfied by human review; nothing to re-drive."
+              exit 0
+            fi
+            suspect_live="true"
+            echo "The review requirements are satisfied, but possibly by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
+          fi
+          # A policy-calling run is identified by its referenced_workflows
+          # entry (present in the list response too — verified against
+          # the live API; the documented schema under-specifies it)
+          # matching the policy-workflow input's full
+          # repository-qualified identity — a first-class join that
+          # survives caller and callee job renames, and that a basename
+          # match would not give: another repository's similarly named
+          # workflow on the same head must not suppress or redirect the
+          # re-drive. Newest first, paginated so a label-churned head
+          # with many runs cannot push the policy run past the window;
+          # every read is guarded so a transient API failure warns as
+          # itself instead of masquerading as "no run exists". The
+          # head_sha filter alone is not PR-specific — one commit can
+          # head several PRs (multi-base, a replacement PR) — so each
+          # run must also carry this PR in its pull_requests association.
+          # That association is itself match-based, not trigger-based
+          # (GitHub lists every open PR whose head matches the run), so a
+          # run associated with more than one PR cannot be attributed to
+          # a triggering PR at all — the walk below stands down on those
+          # rather than re-running another PR's event context.
+          # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
+          if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
+            --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path, (.pull_requests | length | tostring)] | @tsv'); then
+            echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
+            exit 0
+          fi
+          if [[ -z "$run_rows" ]]; then
+            echo "::notice::No policy run exists for the verified head — the PR event delivery itself was lost; the approval waits for the PR's next Dependabot event or a maintainer."
+            exit 0
+          fi
+          # The run-level conclusion cannot be trusted alone: a green
+          # veto-era run may have SKIPPED the policy job entirely (its
+          # job-level veto guard), which is no verdict at all — and a
+          # re-run would re-skip against the frozen still-labeled
+          # payload. Judge the policy job's own conclusion, and walk past
+          # skipped runs to the newest run whose policy job actually
+          # concluded — an older failed pre-veto run is still the right
+          # thing to re-run. An in-progress run supersedes everything
+          # older: stand down and let it finish.
+          target=""
+          target_path=""
+          target_job_id=""
+          conclusion=""
+          while IFS=$'\t' read -r run_id run_path pr_count; do
+            [[ -n "$run_id" ]] || continue
+            if [[ "$pr_count" != "1" ]]; then
+              echo "::notice::Run ${run_id} is associated with ${pr_count} pull requests sharing this head; the API does not identify the triggering PR, so the re-drive stands down rather than re-running another PR's event context."
+              exit 0
+            fi
+            if ! run_status=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}" --jq '.status'); then
+              echo "::warning::Failed to read policy run ${run_id}; leaving the re-drive to the next sweep."
+              exit 0
+            fi
+            if [[ "$run_status" != "completed" ]]; then
+              echo "Policy run ${run_id} is ${run_status}; leaving it to finish."
+              exit 0
+            fi
+            if ! policy_jobs=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${run_id}/jobs?per_page=100" --paginate \
+              --jq '.jobs[] | select(.name | endswith(" / policy")) | [(.id | tostring), (.conclusion // "")] | @tsv'); then
+              echo "::warning::Failed to inspect the jobs of policy run ${run_id}; leaving the re-drive to the next sweep."
+              exit 0
+            fi
+            # The " / policy" suffix could also match a different reusable
+            # callee named policy inside the same run; one job cannot be
+            # told from the other by display name alone, and the
+            # job-level rerun needs one unambiguous job ID — so any
+            # multiple match stands down, agreeing conclusions included.
+            match_count=$(sed '/^$/d' <<<"$policy_jobs" | wc -l | tr -d ' ')
+            if [[ "$match_count" -gt 1 ]]; then
+              echo "::notice::Run ${run_id} carries ${match_count} policy-suffixed jobs; one cannot be told from another by display name, so the re-drive stands down for manual triage."
+              exit 0
+            fi
+            IFS=$'\t' read -r policy_job_id job_conclusion <<<"$(sed -n '1p' <<<"$policy_jobs")"
+            if [[ "$job_conclusion" == "skipped" ]]; then
+              echo "The policy job in run ${run_id} was skipped (a veto-era payload); checking the next older run."
+              continue
+            fi
+            target="$run_id"
+            target_path="$run_path"
+            target_job_id="$policy_job_id"
+            conclusion="$job_conclusion"
+            break
+          done <<<"$run_rows"
+          if [[ -z "$target" ]]; then
+            echo "::notice::Every policy run for the verified head skipped its policy job (veto-era payloads); the approval waits for the PR's next event."
+            exit 0
+          fi
+          case "$conclusion" in
+            success)
+              echo "The policy job in run ${target} is green; the missing approval is policy's own verdict and stays with a maintainer."
+              ;;
+            failure|cancelled|timed_out)
+              # A re-run executes the run's original workflow definition
+              # and inputs — including the caller's policy pin and
+              # privileged-dependencies list. A caller updated since (an
+              # update that emits no PR event) would make the re-run
+              # apply obsolete rules, so re-drive only when the caller
+              # workflow file is byte-identical between the verified head
+              # and the PR's base branch; anything else waits for a fresh
+              # event under the current contract.
+              # Compare against the PR's actual base branch, not the
+              # default branch — Dependabot PRs can target non-default
+              # branches, and it is the base's caller workflow whose
+              # tightening must not be bypassed by a re-run. A retarget
+              # that predates the sweep is covered upstream: the caller
+              # contract's `edited` trigger spawns a fresh policy run on
+              # the new base, which the newest-run walk targets instead
+              # of the frozen old-base run; a dropped edited delivery
+              # degrades to identical-blob approximation. Approximate
+              # by necessity: a re-run executes the run-era merge-time
+              # definition, which the API does not expose, so a base that
+              # changed after the run and reverted since passes this
+              # check while the re-run applies the run-era file. Every
+              # definition in that window was authored on the protected
+              # base branch, so the residual is maintainer config drift,
+              # not a trust-boundary breach.
+              if ! base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName'); then
+                echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              # ref goes through -f so gh URL-encodes it: branch names
+              # may legally carry '#', '&', or '+', which inline in the
+              # query string would make this trust check read the wrong
+              # ref.
+              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_ref" --jq '.sha'); then
+                echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              if ! head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$VERIFIED_HEAD" --jq '.sha'); then
+                echo "::warning::Failed to read the caller workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
+                exit 0
+              fi
+              if [[ "$base_blob" != "$head_blob" ]]; then
+                echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
+                exit 0
+              fi
+              # Last live check before the POST: a synchronize landing
+              # after the arm step's read would make this a stale-head
+              # re-run that displaces the pending current-head policy
+              # run in the shared single-slot group — and a base
+              # retarget's fresh `edited` policy run can itself be
+              # displaced from that slot, so the parity just verified
+              # could still belong to the old base.
+              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName); then
+                echo "::warning::Failed to re-read the PR before the re-run; leaving the re-drive to the next sweep."
+                exit 0
+              fi
+              live_head=$(jq -r '.headRefOid' <<<"$live_pr")
+              live_base=$(jq -r '.baseRefName' <<<"$live_pr")
+              if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
+                echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); that event's policy run owns the new head."
+                exit 0
+              fi
+              if [[ "$live_base" != "$base_ref" ]]; then
+                echo "The PR was retargeted (${base_ref} -> ${live_base}) after the caller parity check; leaving the re-drive to the next sweep."
+                exit 0
+              fi
+              # A possibly-stale App approval over a live arm would let
+              # the worker merge before the rerun repairs policy —
+              # neutralize it first.
+              if [[ "$suspect_live" == "true" ]]; then
+                enforce_disarm "a possibly-stale App approval satisfies the review requirement while policy is re-run"
+              fi
+              # The job-level rerun restores failed and cancelled jobs
+              # alike and repeats only the policy job and its dependents
+              # (the caller's gate), so unrelated caller jobs never
+              # re-run their side effects.
+              echo "Re-running the policy job of run ${target} (conclusion: ${conclusion}) so policy re-decides the approve."
+              if ! GH_TOKEN="$RERUN_TOKEN" gh api -X POST "repos/${GH_REPO}/actions/jobs/${target_job_id}/rerun"; then
+                echo "::warning::Could not re-run the policy job of run ${target} (runs older than 30 days cannot be re-run); leaving the approval to the next sweep or a maintainer."
+              fi
+              ;;
+            *)
+              echo "::notice::Could not identify the policy job's conclusion in run ${target} (saw '${conclusion:-none}'); leaving it for manual triage."
+              ;;
+          esac

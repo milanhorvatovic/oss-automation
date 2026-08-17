@@ -302,8 +302,18 @@ jobs:
             exit 0
           fi
           if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
-            armed=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
-            if [[ "$armed" != "false" ]]; then
+            # A merged PR reads autoMergeRequest null too; the sentinel
+            # must not call the hold effective when the merge already
+            # fired.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less veto check."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged under a live veto label — the hold did not land. Investigate immediately."
+              exit 1
+            fi
+            if [[ "$(jq -r '.autoMergeRequest != null' <<<"$arm_info")" != "false" ]]; then
               echo "::error::PR #${PR_NUMBER} carries a live veto label with auto-merge armed, and the App credential is empty so it cannot be disarmed. Restore the credentials or disarm manually."
               exit 1
             fi
@@ -351,7 +361,18 @@ jobs:
           if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
             bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
               --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
-            armed_by=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
+            # A merged PR reads an empty armer too; the sentinel must
+            # not pass green when the automation it cannot revoke
+            # already completed the merge.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less sentinel."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged during the credential-less check — automation nothing can revoke may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
             if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
               echo "::error::A bot-authored approval or bot-armed auto-merge exists on PR #${PR_NUMBER}, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
               exit 1
@@ -501,7 +522,18 @@ jobs:
           if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
             bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
               --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
-            armed_by=$(gh pr view "$PR_NUMBER" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
+            # A merged PR reads an empty armer too; the sentinel must
+            # not pass green when the automation it cannot revoke
+            # already completed the merge.
+            if ! arm_info=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest); then
+              echo "::error::Failed to read PR #${PR_NUMBER}'s state on the credential-less sentinel."
+              exit 1
+            fi
+            if [[ "$(jq -r '.state' <<<"$arm_info")" == "MERGED" ]]; then
+              echo "::error::PR #${PR_NUMBER} merged during the credential-less check — automation nothing can revoke may have completed the merge. Investigate immediately."
+              exit 1
+            fi
+            armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
             if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
               echo "::error::PR #${PR_NUMBER} carries unverifiable commits alongside a bot approval or bot-armed auto-merge, and the automation-client-id secret is empty, so nothing can revoke it. Restore the App credentials or clean the PR up manually."
               exit 1
@@ -775,9 +807,20 @@ jobs:
           # the enable refuse instead of arming content the tamper check
           # never inspected; the loop's own head read stands the run down
           # the moment the head moves.
+          if [[ "$wrong_method_arm" == "true" ]]; then
+            # Normalize before the first enable, so no failure path in
+            # the loop below can exit with the observed non-squash arm
+            # still live — a red job would not stop that arm from
+            # merging with the forbidden method later.
+            echo "Auto-merge is armed with ${merge_method}; disarming before the squash enable."
+            gh pr merge --disable-auto "$PR_NUMBER" 2>&1 || true
+          fi
           gh pr merge --auto --squash --match-head-commit "$VERIFIED_HEAD" "$PR_NUMBER" 2>&1 || true
           for attempt in {1..6}; do
-            state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid)
+            if ! state=$(gh pr view "$PR_NUMBER" --json state,autoMergeRequest,headRefOid); then
+              echo "::error::Failed to read PR #${PR_NUMBER} inside the arm verification loop."
+              exit 1
+            fi
             pr_state=$(jq -r '.state' <<<"$state")
             method=$(jq -r '.autoMergeRequest.mergeMethod // ""' <<<"$state")
             live_head=$(jq -r '.headRefOid' <<<"$state")

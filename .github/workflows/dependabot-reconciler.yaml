@@ -670,6 +670,11 @@ jobs:
           POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
+          # Callers habitually write workflow identities with an @ref
+          # suffix; the referenced_workflows match needs the bare path,
+          # and an unstripped suffix would silently stand every lookup
+          # down.
+          POLICY_WORKFLOW="${POLICY_WORKFLOW%%@*}"
           # Detection without neutralization is not a stand-down: any
           # path that discovers a hazardous approval over an existing
           # arm must kill the merge vector, verified and MERGED-aware,
@@ -1140,6 +1145,11 @@ jobs:
           POLICY_WORKFLOW: ${{ inputs.policy-workflow }}
         run: |
           set -euo pipefail
+          # Callers habitually write workflow identities with an @ref
+          # suffix; the referenced_workflows match needs the bare path,
+          # and an unstripped suffix would silently stand every lookup
+          # down.
+          POLICY_WORKFLOW="${POLICY_WORKFLOW%%@*}"
           # Same stance as the arm step: a hazardous approval discovered
           # over an existing arm is neutralized, verified and
           # MERGED-aware, before this step yields or reruns.

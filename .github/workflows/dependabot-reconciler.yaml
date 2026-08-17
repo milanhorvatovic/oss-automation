@@ -730,12 +730,28 @@ jobs:
             exit 1
           fi
           if [[ "$decision" == "APPROVED" ]]; then
-            app_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' ')
-            if [[ "$app_approvals" != "0" ]]; then
+            # Suspect only when the App's approval can be what satisfies
+            # the decision: an App approval pinned to the verified head,
+            # or any App approval with no human approval on the current
+            # head. An old-head App review under a fresh human approval
+            # is inert and must not stall arming — under a
+            # require-most-recent-push rule it stays APPROVED forever.
+            if ! reviews=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp --jq 'add // []'); then
+              echo "::error::Failed to list PR #${PR_NUMBER}'s reviews before arming; refusing to mutate blind."
+              exit 1
+            fi
+            app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
+            app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
+            human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            if [[ "$app_head" != "0" || ( "$app_any" != "0" && "$human_head" == "0" ) ]]; then
+              # Slurped so [0] picks the newest across pages (per-page it
+              # would emit one id per page), and the exactly-one PR
+              # association rule matches the re-drive's: a multi-PR head
+              # cannot attribute a run, and a green run for another PR
+              # must not validate this one's approval.
               # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
-              trust_run=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
-                --jq '(env.PR_NUMBER | tonumber) as $n | [.workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@")))][0].id // ""')
+              trust_run=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
+                --jq '(env.PR_NUMBER | tonumber) as $n | [.[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@")))][0].id // ""') || trust_run=""
               job_ok="false"
               if [[ -n "$trust_run" ]]; then
                 if ! job_ok=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}/jobs?per_page=100" --paginate --slurp \
@@ -1030,13 +1046,24 @@ jobs:
             exit 0
           fi
           if [[ "$decision" == "APPROVED" ]]; then
-            app_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
-              --jq ".[] | select(.user.login == \"${BOT_LOGIN}\" and .state == \"APPROVED\") | .id" | wc -l | tr -d ' ')
-            if [[ "$app_approvals" == "0" ]]; then
+            # Same suspect predicate as the arm step: an App approval on
+            # the verified head, or any App approval with no human
+            # approval on the current head, keeps the archaeology going;
+            # an inert old-head App review under a fresh human approval
+            # exits here instead of stalling on a missing rerun token or
+            # eligible run.
+            if ! reviews=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews?per_page=100" --paginate --slurp --jq 'add // []'); then
+              echo "::warning::Failed to list the PR's reviews; leaving the re-drive to the next sweep."
+              exit 0
+            fi
+            app_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED" and .commit_id == $h)] | length' <<<"$reviews")
+            app_any=$(jq -r --arg b "$BOT_LOGIN" '[.[] | select(.user.login == $b and .state == "APPROVED")] | length' <<<"$reviews")
+            human_head=$(jq -r --arg h "$VERIFIED_HEAD" --arg b "$BOT_LOGIN" '[.[] | select(.state == "APPROVED" and .commit_id == $h and .user.login != $b and ((.user.login | endswith("[bot]")) | not))] | length' <<<"$reviews")
+            if [[ "$app_head" == "0" && ( "$app_any" == "0" || "$human_head" != "0" ) ]]; then
               echo "The review requirements are satisfied by human review; nothing to re-drive."
               exit 0
             fi
-            echo "The review requirements are satisfied, but by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
+            echo "The review requirements are satisfied, but possibly by an App approval; continuing to the newest policy run, since a failed revocation can leave an approval it could not dismiss."
           fi
           # A policy-calling run is identified by its referenced_workflows
           # entry matching the policy-workflow input's full

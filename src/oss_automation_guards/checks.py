@@ -35,21 +35,24 @@ _AUTHOR_PIN = "github.event.pull_request.user.login"
 _HEAD_REPO_PIN = "github.event.pull_request.head.repo.full_name"
 
 
-def _equality_pin(path: str) -> re.Pattern[str]:
-    escaped = re.escape(path)
-    return re.compile(rf"{escaped}\s*==|==\s*{escaped}", re.IGNORECASE)
+def _delimited(path: str) -> str:
+    # Both ends anchored so a longer identifier sharing the path as prefix or
+    # suffix (user.login_suffix, xgithub.event...) can never satisfy a pin.
+    return rf"(?<![\w.-]){re.escape(path)}(?![\w.-])"
 
 
 # Equality only: a negated or merely-mentioned pin is not a trust guard.
 # Structural, not semantic — the guard proves an equality on the pin exists,
 # not that it gates the job (`always() || <pin>` still passes).
-_AUTHOR_EQUALITY = _equality_pin(_AUTHOR_PIN)
+_AUTHOR_EQUALITY = re.compile(
+    rf"{_delimited(_AUTHOR_PIN)}\s*==|==\s*{_delimited(_AUTHOR_PIN)}", re.IGNORECASE
+)
 # The head pin must compare against github.repository specifically — an
 # equality with any other operand (a fork literal, another context) would
 # pass a job that runs credentialed on foreign heads.
 _HEAD_REPO_EQUALITY = re.compile(
-    rf"{re.escape(_HEAD_REPO_PIN)}\s*==\s*github\.repository\b"
-    rf"|github\.repository\s*==\s*{re.escape(_HEAD_REPO_PIN)}",
+    rf"{_delimited(_HEAD_REPO_PIN)}\s*==\s*{_delimited('github.repository')}"
+    rf"|{_delimited('github.repository')}\s*==\s*{_delimited(_HEAD_REPO_PIN)}",
     re.IGNORECASE,
 )
 # The \b keeps distinct contexts like github.actor_id from matching. The

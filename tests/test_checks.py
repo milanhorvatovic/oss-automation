@@ -536,6 +536,26 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) == []
 
+    def test_suffixed_pin_identifiers_are_not_a_trust_guard(self) -> None:
+        # A longer identifier sharing the pin path as its prefix must not
+        # satisfy the guard in either operand order.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  'x' == github.event.pull_request.user.login_suffix &&
+                  github.repository == github.event.pull_request.head.repo.full_name_suffix
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
     def test_head_pin_against_a_literal_repository_is_not_a_trust_guard(self) -> None:
         parsed = workflow(
             """

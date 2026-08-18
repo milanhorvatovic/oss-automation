@@ -536,6 +536,79 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) == []
 
+    def test_negated_equalities_are_not_a_trust_guard(self) -> None:
+        # Both pins sit under a unary negation, selecting exactly the
+        # untrusted author and foreign head the guard exists to exclude.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  !(github.event.pull_request.user.login == 'dependabot[bot]') &&
+                  !(github.event.pull_request.head.repo.full_name == github.repository)
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+    def test_double_negated_pins_still_pass(self) -> None:
+        # !!x is x; parity keeps the guard from reading it as a negation.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  !!(github.event.pull_request.user.login == 'dependabot[bot]') &&
+                  !!(github.event.pull_request.head.repo.full_name == github.repository)
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_index_syntax_pins_are_accepted(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  github['event']['pull_request']['user']['login'] == 'dependabot[bot]' &&
+                  github['event']['pull_request']['head']['repo']['full_name'] ==
+                  github['repository']
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_secret_after_a_literal_containing_the_terminator_is_credentialed(self) -> None:
+        # The '{0} }}' literal must not be mistaken for the expression's end,
+        # which would hide the secret reference that follows it.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                steps:
+                  - run: echo "${{ format('{0} }}', secrets.DEPLOY_TOKEN) }}"
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) != []
+
     def test_author_self_comparison_is_not_a_trust_guard(self) -> None:
         # login == login is true for every author; only a comparison against
         # a literal identity counts as the pin.
@@ -655,6 +728,21 @@ class TestTrustModel:
             """
         )
         assert checks.unguarded_pr_credentials(parsed) != []
+
+    def test_indexed_github_token_stays_exempt(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              build:
+                steps:
+                  - run: gh pr view
+                    env:
+                      GH_TOKEN: ${{ secrets['GITHUB_TOKEN'] }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
 
     def test_github_token_exemption_is_case_insensitive(self) -> None:
         parsed = workflow(

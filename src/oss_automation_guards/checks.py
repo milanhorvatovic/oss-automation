@@ -12,6 +12,7 @@ from typing import Any
 
 import yaml
 
+from .expressions import expression_bodies, has_unnegated, normalize
 from .model import WorkflowFile
 
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
@@ -19,13 +20,12 @@ _DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
 _VERSION_SHAPED = re.compile(r"\d")
 
 # GitHub expression contexts are case-insensitive, so every pattern below
-# matches that way; expression string literals are single-quoted only. The
-# secrets context resolves only inside ${{ }} bodies (even `if:` values are
-# wrapped implicitly but cannot read secrets), so only expression bodies are
-# scanned — literal text like `echo 'secrets.KEY'` is inert.
-_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
+# matches that way. The secrets context resolves only inside ${{ }} bodies,
+# so only those are scanned — literal text like `echo 'secrets.KEY'` is inert.
 _SECRET_DOT = re.compile(r"\bsecrets\.([A-Za-z0-9_]+)", re.IGNORECASE)
-_SECRET_INDEX = re.compile(r"\bsecrets\s*\[\s*(?:'([^']*)')?", re.IGNORECASE)
+# Only a dynamic key survives normalization as an index; it can name any
+# secret, so it counts as credentialed.
+_SECRET_INDEX = re.compile(r"\bsecrets\s*\[", re.IGNORECASE)
 # Bare context use — toJSON(secrets), fromJSON, a naked `secrets` — exposes
 # every secret at once, so it can never ride the GITHUB_TOKEN exemption.
 _SECRET_CONTEXT = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.IGNORECASE)
@@ -60,15 +60,9 @@ _HEAD_REPO_EQUALITY = re.compile(
     rf"|{_delimited('github.repository')}\s*==\s*{_delimited(_HEAD_REPO_PIN)}",
     re.IGNORECASE,
 )
-# The \b keeps distinct contexts like github.actor_id from matching. The
-# index form is matched against the raw condition — its quoted 'actor' is
-# exactly what literal-stripping would erase.
+# The \b keeps distinct contexts like github.actor_id from matching; the
+# indexed spelling arrives here as a dot path via normalization.
 _ACTOR_REFERENCE = re.compile(r"github\.actor\b", re.IGNORECASE)
-_ACTOR_INDEX = re.compile(r"\bgithub\s*\[\s*'actor'\s*\]", re.IGNORECASE)
-# GitHub-expression string literals ('' escapes a quote). Stripped from a
-# condition before the pin checks run, so pin-shaped text inside a truthy
-# literal cannot satisfy a guard it never evaluates.
-_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
 
 def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
@@ -145,20 +139,19 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
         if not (workflow_credentialed or _holds_credentials(job, workflow)):
             continue
         raw_condition = job.get("if")
-        raw_condition = raw_condition if isinstance(raw_condition, str) else ""
-        condition = _STRING_LITERAL.sub("''", raw_condition)
+        condition = normalize(raw_condition if isinstance(raw_condition, str) else "")
         prefix = f"job '{job_id}' holds credentials on a {'/'.join(pr_triggers)} trigger"
-        if not _AUTHOR_EQUALITY.search(condition):
+        if not has_unnegated(_AUTHOR_EQUALITY, condition):
             findings.append(
                 f"{prefix} but its `if:` does not pin the pull-request author by"
                 f" comparing {_AUTHOR_PIN} against a literal identity"
             )
-        if not _HEAD_REPO_EQUALITY.search(condition):
+        if not has_unnegated(_HEAD_REPO_EQUALITY, condition):
             findings.append(
                 f"{prefix} but its `if:` does not pin the head repository via"
                 f" {_HEAD_REPO_PIN} == github.repository"
             )
-        if _ACTOR_REFERENCE.search(condition) or _ACTOR_INDEX.search(raw_condition):
+        if _ACTOR_REFERENCE.search(condition):
             findings.append(
                 f"job '{job_id}' keys trust on github.actor; a synchronize event emitted"
                 " by another actor (e.g. an automation App updating the branch) carries"
@@ -261,14 +254,12 @@ def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile) -> bool:
 
 
 def _references_secret(node: Any) -> bool:
-    serialized = json.dumps(node, default=str)
     names = set()
-    for expression in _EXPRESSION.findall(serialized):
+    for body in expression_bodies(json.dumps(node, default=str)):
+        expression = normalize(body)
         names.update(name.lower() for name in _SECRET_DOT.findall(expression))
-        for match in _SECRET_INDEX.finditer(expression):
-            literal = match.group(1)
-            # A dynamic index can name any secret; treat it as credentialed.
-            names.add(literal.lower() if literal is not None else "<dynamic>")
+        if _SECRET_INDEX.search(expression):
+            names.add("<dynamic>")
         if _SECRET_CONTEXT.search(expression):
             names.add("<context>")
     return bool(names - {"github_token"})

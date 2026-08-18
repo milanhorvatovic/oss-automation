@@ -52,8 +52,15 @@ _HEAD_REPO_EQUALITY = re.compile(
     rf"|github\.repository\s*==\s*{re.escape(_HEAD_REPO_PIN)}",
     re.IGNORECASE,
 )
-# The \b keeps distinct contexts like github.actor_id from matching.
+# The \b keeps distinct contexts like github.actor_id from matching. The
+# index form is matched against the raw condition — its quoted 'actor' is
+# exactly what literal-stripping would erase.
 _ACTOR_REFERENCE = re.compile(r"github\.actor\b", re.IGNORECASE)
+_ACTOR_INDEX = re.compile(r"\bgithub\s*\[\s*'actor'\s*\]", re.IGNORECASE)
+# GitHub-expression string literals ('' escapes a quote). Stripped from a
+# condition before the pin checks run, so pin-shaped text inside a truthy
+# literal cannot satisfy a guard it never evaluates.
+_STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 
 
 def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
@@ -123,15 +130,15 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
     if not pr_triggers:
         return []
     findings = []
-    target_triggered = "pull_request_target" in pr_triggers
     # A secret in the workflow-level env reaches every job, so it makes the
     # whole workflow's jobs credentialed, not just the ones referencing it.
     workflow_credentialed = _references_secret(workflow.data.get("env"))
     for job_id, job in workflow.jobs.items():
-        if not (workflow_credentialed or _holds_credentials(job, workflow, target_triggered)):
+        if not (workflow_credentialed or _holds_credentials(job, workflow)):
             continue
-        condition = job.get("if")
-        condition = condition if isinstance(condition, str) else ""
+        raw_condition = job.get("if")
+        raw_condition = raw_condition if isinstance(raw_condition, str) else ""
+        condition = _STRING_LITERAL.sub("''", raw_condition)
         prefix = f"job '{job_id}' holds credentials on a {'/'.join(pr_triggers)} trigger"
         if not _AUTHOR_EQUALITY.search(condition):
             findings.append(
@@ -143,7 +150,7 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
                 f"{prefix} but its `if:` does not pin the head repository via"
                 f" {_HEAD_REPO_PIN} == github.repository"
             )
-        if _ACTOR_REFERENCE.search(condition):
+        if _ACTOR_REFERENCE.search(condition) or _ACTOR_INDEX.search(raw_condition):
             findings.append(
                 f"job '{job_id}' keys trust on github.actor; a synchronize event emitted"
                 " by another actor (e.g. an automation App updating the branch) carries"
@@ -231,16 +238,18 @@ def _is_scope_pin(value: Any) -> bool:
     )
 
 
-def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile, target_triggered: bool) -> bool:
+def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile) -> bool:
     if job.get("secrets") == "inherit":
         return True
     # A `secrets:` mapping on a reusable-workflow call is covered by the
     # reference scan below, so passing only the default token stays exempt.
     if _references_secret(job):
         return True
-    # On pull_request the token of a fork PR is forced read-only server-side;
-    # only pull_request_target combines untrusted PR context with write scopes.
-    return target_triggered and _grants_write(job, workflow)
+    # Declared write scopes are credentials on either PR trigger: only a
+    # public repository's fork PRs get a force-downgraded token on
+    # pull_request — same-repo runs receive the declared scopes, and private
+    # repositories can extend write tokens to fork PRs by settings.
+    return _grants_write(job, workflow)
 
 
 def _references_secret(node: Any) -> bool:

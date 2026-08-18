@@ -582,6 +582,23 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) == []
 
+    def test_index_syntax_actor_keying_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF} && github['actor'] == 'dependabot[bot]'
+                secrets: inherit
+                uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "github.actor" in findings[0]
+
     def test_index_syntax_secret_reference_is_credentialed(self) -> None:
         parsed = workflow(
             """
@@ -626,9 +643,10 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) == []
 
-    def test_write_scopes_on_plain_pull_request_are_not_credentialed(self) -> None:
-        # A fork PR's token is forced read-only server-side on pull_request;
-        # only pull_request_target pairs untrusted context with real writes.
+    def test_write_scopes_on_plain_pull_request_are_credentialed(self) -> None:
+        # Same-repo pull_request runs receive the declared write scopes (only
+        # a public repo's fork PRs are force-downgraded), so write scopes are
+        # credentials on either PR trigger.
         parsed = workflow(
             """
             on:
@@ -641,4 +659,23 @@ class TestTrustModel:
                   - run: gh pr edit
             """
         )
-        assert checks.unguarded_pr_credentials(parsed) == []
+        assert checks.unguarded_pr_credentials(parsed) != []
+
+    def test_pins_inside_a_string_literal_are_not_a_trust_guard(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  'github.event.pull_request.user.login == dependabot &&
+                  github.event.pull_request.head.repo.full_name == github.repository'
+                  != ''
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2

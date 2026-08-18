@@ -499,6 +499,27 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) != []
 
+    def test_reusable_call_does_not_inherit_the_workflow_env(self) -> None:
+        # Workflow-level env reaches runner steps; a call job has none, and
+        # the callee never sees the caller's env.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            env:
+              TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            jobs:
+              call:
+                uses: owner/repo/.github/workflows/callee.yaml@main
+              build:
+                steps:
+                  - run: build
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert findings
+        assert all("'build'" in finding for finding in findings)
+
     def test_secrets_inherit_is_credentialed(self) -> None:
         parsed = workflow(
             """
@@ -611,6 +632,63 @@ class TestTrustModel:
                 if: >-
                   !!(github.event.pull_request.user.login == 'dependabot[bot]') &&
                   !!(github.event.pull_request.head.repo.full_name == github.repository)
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_pins_compared_against_false_are_not_a_trust_guard(self) -> None:
+        # (pin) == false selects the complement, exactly as !(pin) does.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  (github.event.pull_request.user.login == 'dependabot[bot]') == false &&
+                  (github.event.pull_request.head.repo.full_name == github.repository) == false
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+    def test_pins_compared_against_not_true_are_not_a_trust_guard(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  (github.event.pull_request.user.login == 'dependabot[bot]') != true &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
+
+    def test_pins_compared_against_true_still_pass(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  (github.event.pull_request.user.login == 'dependabot[bot]') == true &&
+                  (github.event.pull_request.head.repo.full_name == github.repository) != false
                 steps:
                   - run: deploy
                     env:

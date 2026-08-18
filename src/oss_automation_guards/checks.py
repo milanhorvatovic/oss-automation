@@ -140,11 +140,15 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
     if not pr_triggers:
         return []
     findings = []
-    # A secret in the workflow-level env reaches every job, so it makes the
-    # whole workflow's jobs credentialed, not just the ones referencing it.
+    # A secret in the workflow-level env reaches the steps of every runner
+    # job, so those are credentialed whether or not they name it. A job that
+    # calls a reusable workflow has no steps of its own and the callee does
+    # not inherit the caller's env, so it is credentialed only by what it
+    # passes down.
     workflow_credentialed = _references_secret(workflow.data.get("env"))
     for job_id, job in workflow.jobs.items():
-        if not (workflow_credentialed or _holds_credentials(job, workflow)):
+        inherits_env = workflow_credentialed and "uses" not in job
+        if not (inherits_env or _holds_credentials(job, workflow)):
             continue
         raw_condition = job.get("if")
         condition = normalize(raw_condition if isinstance(raw_condition, str) else "")

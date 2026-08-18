@@ -14,6 +14,8 @@ _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 # Index dereference with a literal property name — the indexed spelling of a
 # dot path. Property names are identifiers; anything else is a value.
 _INDEX_KEY = re.compile(r"\[\s*'([A-Za-z_][A-Za-z0-9_-]*)'\s*\]")
+# A comparison against a boolean literal, applied to whatever precedes it.
+_BOOLEAN_COMPARISON = re.compile(r"\s*(==|!=)\s*(true|false)\b", re.IGNORECASE)
 
 
 def expression_bodies(text: str) -> list[str]:
@@ -56,18 +58,15 @@ def normalize(expression: str) -> str:
 def has_unnegated(pattern: re.Pattern[str], expression: str) -> bool:
     """Whether `pattern` matches in positive sense anywhere.
 
-    A pin under `!( ... )` selects the complement of the trusted identity, so
-    a match there is the opposite of the guard it resembles. Each enclosing
-    negation flips the sense, so an even count — none, or `!(!( ... ))` —
-    reads as the positive pin it is equivalent to. A `!` bound directly to
-    the matched operand counts the same way: `!` binds tighter than `==`, so
-    `!path == 'x'` compares a negated operand, never the path itself.
+    An inverted pin selects the complement of the trusted identity, so a
+    match under one is the opposite of the guard it resembles. Three forms
+    invert, and they compose: a `!` on an enclosing group, a `!` bound
+    directly to the matched operand (`!` binds tighter than `==`, so
+    `!path == 'x'` negates the operand, not the comparison), and a boolean
+    comparison applied to the result (`( ... ) == false`, `( ... ) != true`).
+    Parity decides, so `!(!( ... ))` reads as the positive pin it equals.
     """
-    depths = _negation_depths(expression)
-    return any(
-        (depths[match.start()] + _bang_parity(expression, match.start())) % 2 == 0
-        for match in pattern.finditer(expression)
-    )
+    return any(_inversion_parity(expression, match) == 0 for match in pattern.finditer(expression))
 
 
 def _past_literal(text: str, start: int) -> int:
@@ -89,19 +88,33 @@ def _bang_parity(expression: str, index: int) -> int:
     return (len(preceding) - len(preceding.rstrip("!"))) % 2
 
 
-def _negation_depths(expression: str) -> list[int]:
-    """Per character, how many negated groups enclose it.
+def _inversion_parity(expression: str, match: re.Match[str]) -> int:
+    """How many inversions apply to `match`, modulo two."""
+    inversions = _bang_parity(expression, match.start())
+    inversions += _boolean_inversion(expression, match.end())
+    for open_index, close_index in _group_pairs(expression).items():
+        if open_index < match.start() and match.end() <= close_index:
+            inversions += _bang_parity(expression, open_index)
+            inversions += _boolean_inversion(expression, close_index + 1)
+    return inversions % 2
 
-    The caller reads this modulo two; the raw count is kept so nesting and
-    stacked `!` operators compose.
-    """
-    depths = []
-    stack: list[bool] = []
+
+def _boolean_inversion(expression: str, index: int) -> int:
+    """Whether a boolean comparison at `index` inverts what precedes it."""
+    match = _BOOLEAN_COMPARISON.match(expression, index)
+    if match is None:
+        return 0
+    negative = match.group(1) == "==" and match.group(2).lower() == "false"
+    negative |= match.group(1) == "!=" and match.group(2).lower() == "true"
+    return 1 if negative else 0
+
+
+def _group_pairs(expression: str) -> dict[int, int]:
+    pairs = {}
+    stack: list[int] = []
     for index, char in enumerate(expression):
         if char == "(":
-            # Parity, so `!!(x)` reads as the no-op it is.
-            stack.append(_bang_parity(expression, index) == 1)
-        depths.append(sum(stack))
-        if char == ")" and stack:
-            stack.pop()
-    return depths
+            stack.append(index)
+        elif char == ")" and stack:
+            pairs[stack.pop()] = index
+    return pairs

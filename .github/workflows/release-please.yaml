@@ -1,0 +1,130 @@
+name: Release Please
+
+# Reusable Conventional-Commits release flow: the caller runs on pushes to
+# its default branch, and release-please maintains a release PR accumulating
+# the version bump and changelog; merging that PR tags and releases. The
+# version bump is computed from Conventional Commits, so the caller's commit
+# (or squash-title) convention must follow them — callers that do not are
+# better served by the tag-driven release-tag workflow.
+#
+# The calling job must declare `permissions: {contents: write, issues: write,
+# pull-requests: write}` verbatim: a called workflow can only downgrade the
+# caller's token, never raise it, so on a repository or org whose default
+# token is read-only the job below fails before a single step runs. The issues
+# scope is not spare: release-please tracks its own release PR by the
+# autorelease labels, and labelling a pull request goes through the issues
+# API.
+#
+# Serialize the calling job — `concurrency: {group: release-please,
+# cancel-in-progress: false}`. Two default-branch merges seconds apart start
+# two runs that reconcile the same release branch and PR, and the loser leaves
+# a stale release-PR body that self-heals only on the next push. Silent, so
+# the group belongs to the caller rather than being imposed here: the callee
+# cannot know what else a consumer serializes against.
+#
+# Token caveat: a release PR or release created with the default GITHUB_TOKEN
+# never triggers the caller's other workflows (GitHub's recursion guard), so
+# CI would not run on the release PR. Pass the App credential pair for a
+# fully wired flow; the default token remains the fallback. Consumers needing
+# manifest-mode or a config file should call release-please-action directly —
+# this wrapper deliberately carries the simple surface only.
+
+on:
+  workflow_call:
+    inputs:
+      release-type:
+        description: >-
+          release-please release-type matching the project (e.g. python,
+          node, rust, go, simple).
+        required: false
+        type: string
+        default: simple
+      target-branch:
+        description: Branch releases are cut from; empty means the caller's default branch.
+        required: false
+        type: string
+        default: ""
+    secrets:
+      automation-client-id:
+        description: Optional client ID of a GitHub App; with the private key, release PRs trigger CI.
+        required: false
+      automation-private-key:
+        description: Private key of the same GitHub App.
+        required: false
+    outputs:
+      releases-created:
+        description: >-
+          'true' when this run cut at least one release — the condition a
+          follow-on publish job gates on, since the job succeeds either way.
+        value: ${{ jobs.release-please.outputs.releases-created }}
+      tag-name:
+        description: Tag of the release this run cut, empty when it cut none.
+        value: ${{ jobs.release-please.outputs.tag-name }}
+      html-url:
+        description: Web URL of the release this run cut.
+        value: ${{ jobs.release-please.outputs.html-url }}
+      prs-created:
+        description: "'true' when this run opened or updated a release PR."
+        value: ${{ jobs.release-please.outputs.prs-created }}
+
+permissions:
+  contents: read
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      issues: write
+      pull-requests: write
+    # Renamed to this repository's kebab-case convention; the action's own
+    # snake_case names stay on the right-hand side.
+    outputs:
+      releases-created: ${{ steps.release-please.outputs.releases_created }}
+      tag-name: ${{ steps.release-please.outputs.tag_name }}
+      html-url: ${{ steps.release-please.outputs.html_url }}
+      prs-created: ${{ steps.release-please.outputs.prs_created }}
+    env:
+      # Step `if:` conditions cannot read the secrets context; surface the
+      # presence of each half of the App credential here (booleans, never the
+      # values).
+      AUTOMATION_ID_PRESENT: ${{ secrets.automation-client-id != '' }}
+      AUTOMATION_KEY_PRESENT: ${{ secrets.automation-private-key != '' }}
+    steps:
+      # Half a pair is a configuration error, not a choice to use the
+      # fallback: a client ID alone fails inside the mint step, and a private
+      # key alone would degrade silently to the default token, leaving the
+      # release PR without the CI runs this flow exists to wire.
+      - name: Refuse a half-configured App credential pair
+        if: env.AUTOMATION_ID_PRESENT != env.AUTOMATION_KEY_PRESENT
+        run: |
+          set -euo pipefail
+          echo "::error::Pass both automation-client-id and automation-private-key, or neither."
+          exit 1
+
+      - name: Mint the automation-bot token
+        id: bot-token
+        if: env.AUTOMATION_ID_PRESENT == 'true'
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ secrets.automation-client-id }}
+          private-key: ${{ secrets.automation-private-key }}
+          # Downscope from the App's full installation grant to what
+          # release-please calls: tags and releases live under contents, and
+          # the autorelease labels it tracks its own PR by are issues.
+          permission-contents: write
+          permission-issues: write
+          permission-pull-requests: write
+
+      - name: Run release-please
+        id: release-please
+        uses: googleapis/release-please-action@45996ed1f6d02564a971a2fa1b5860e934307cf7 # v5.0.0
+        with:
+          token: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
+          release-type: ${{ inputs.release-type }}
+          # Left empty on purpose: the action detects the caller's default
+          # branch itself. Substituting github.ref_name would follow whatever
+          # ref the run carries — a workflow_dispatch on a feature branch cuts
+          # a release from it, silently.
+          target-branch: ${{ inputs.target-branch }}

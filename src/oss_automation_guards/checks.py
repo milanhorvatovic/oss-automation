@@ -12,59 +12,32 @@ from typing import Any
 
 import yaml
 
-from .expressions import expression_bodies, has_unnegated, normalize
+from .expressions import (
+    ContextPath,
+    ExpressionError,
+    Value,
+    context_paths,
+    expression_bodies,
+    parse,
+    parse_condition,
+    positive_equalities,
+)
 from .model import WorkflowFile
 
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
 _VERSION_SHAPED = re.compile(r"\d")
-
-# GitHub expression contexts are case-insensitive, so every pattern below
-# matches that way. The secrets context resolves only inside ${{ }} bodies,
-# so only those are scanned — literal text like `echo 'secrets.KEY'` is inert.
-_SECRET_DOT = re.compile(r"\bsecrets\.([A-Za-z0-9_]+)", re.IGNORECASE)
-# Only a dynamic key survives normalization as an index; it can name any
-# secret, so it counts as credentialed.
-_SECRET_INDEX = re.compile(r"\bsecrets\s*\[", re.IGNORECASE)
-# Whole-context use — toJSON(secrets), the secrets.* object filter, a naked
-# `secrets` — exposes every secret at once, so it can never ride the
-# GITHUB_TOKEN exemption. Anything that is not a named property or an index
-# dereferences the context as a whole.
-_SECRET_CONTEXT = re.compile(r"\bsecrets\b(?!\s*(?:\[|\.\s*[A-Za-z_]))", re.IGNORECASE)
+# Only consulted when an expression does not parse, to decide whether the
+# unknown could have been a credential.
+_SECRETS_MENTION = re.compile(r"\bsecrets\b", re.IGNORECASE)
 
 _PR_TRIGGERS = frozenset({"pull_request", "pull_request_target"})
+# Context paths are matched case-insensitively, as GitHub resolves them.
 _AUTHOR_PIN = "github.event.pull_request.user.login"
 _HEAD_REPO_PIN = "github.event.pull_request.head.repo.full_name"
-
-
-def _delimited(path: str) -> str:
-    # Both ends anchored so a longer identifier sharing the path as prefix or
-    # suffix (user.login_suffix, xgithub.event...) can never satisfy a pin.
-    return rf"(?<![\w.-]){re.escape(path)}(?![\w.-])"
-
-
-# Equality only: a negated or merely-mentioned pin is not a trust guard.
-# Structural, not semantic — the guard proves an equality on the pin exists,
-# not that it gates the job (`always() || <pin>` still passes).
-#
-# The author pin must compare against a string literal — the '' placeholder
-# literal-stripping leaves behind — so a tautology (login == login) or a
-# comparison against another dynamic context never counts as an identity pin.
-_AUTHOR_EQUALITY = re.compile(
-    rf"{_delimited(_AUTHOR_PIN)}\s*==\s*''|''\s*==\s*{_delimited(_AUTHOR_PIN)}",
-    re.IGNORECASE,
-)
-# The head pin must compare against github.repository specifically — an
-# equality with any other operand (a fork literal, another context) would
-# pass a job that runs credentialed on foreign heads.
-_HEAD_REPO_EQUALITY = re.compile(
-    rf"{_delimited(_HEAD_REPO_PIN)}\s*==\s*{_delimited('github.repository')}"
-    rf"|{_delimited('github.repository')}\s*==\s*{_delimited(_HEAD_REPO_PIN)}",
-    re.IGNORECASE,
-)
-# The \b keeps distinct contexts like github.actor_id from matching; the
-# indexed spelling arrives here as a dot path via normalization.
-_ACTOR_REFERENCE = re.compile(r"github\.actor\b", re.IGNORECASE)
+_REPOSITORY = "github.repository"
+_ACTOR = "github.actor"
+_DEFAULT_TOKEN = "github_token"
 
 
 def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
@@ -151,19 +124,26 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
         if not (inherits_env or _holds_credentials(job, workflow)):
             continue
         raw_condition = job.get("if")
-        condition = normalize(raw_condition if isinstance(raw_condition, str) else "")
+        # An unparseable condition proves nothing, so it pins nothing: the
+        # guard reports both pins missing rather than assume the best.
+        try:
+            condition = parse_condition(raw_condition) if isinstance(raw_condition, str) else None
+        except ExpressionError:
+            condition = None
+        equalities = positive_equalities(condition) if condition is not None else []
+        paths = context_paths(condition) if condition is not None else []
         prefix = f"job '{job_id}' holds credentials on a {'/'.join(pr_triggers)} trigger"
-        if not has_unnegated(_AUTHOR_EQUALITY, condition):
+        if not _pins_literal_identity(equalities, _AUTHOR_PIN):
             findings.append(
                 f"{prefix} but its `if:` does not pin the pull-request author by"
                 f" comparing {_AUTHOR_PIN} against a literal identity"
             )
-        if not has_unnegated(_HEAD_REPO_EQUALITY, condition):
+        if not _pins_paths(equalities, _HEAD_REPO_PIN, _REPOSITORY):
             findings.append(
                 f"{prefix} but its `if:` does not pin the head repository via"
                 f" {_HEAD_REPO_PIN} == github.repository"
             )
-        if _ACTOR_REFERENCE.search(condition):
+        if any(_is_path(path, _ACTOR) for path in paths):
             findings.append(
                 f"job '{job_id}' keys trust on github.actor; a synchronize event emitted"
                 " by another actor (e.g. an automation App updating the branch) carries"
@@ -289,16 +269,54 @@ def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile) -> bool:
     return _grants_write(job, workflow)
 
 
+def _is_path(node: Any, dotted: str) -> bool:
+    return (
+        isinstance(node, ContextPath) and not node.dynamic and node.dotted.lower() == dotted.lower()
+    )
+
+
+def _pins_literal_identity(equalities: list[tuple[Any, Any]], path: str) -> bool:
+    """Whether some asserted equality compares `path` to a string literal."""
+    for left, right in equalities:
+        for candidate, other in ((left, right), (right, left)):
+            if _is_path(candidate, path) and isinstance(other, Value) and other.kind == "string":
+                return True
+    return False
+
+
+def _pins_paths(equalities: list[tuple[Any, Any]], path: str, expected: str) -> bool:
+    """Whether some asserted equality compares the two given paths."""
+    for left, right in equalities:
+        for candidate, other in ((left, right), (right, left)):
+            if _is_path(candidate, path) and _is_path(other, expected):
+                return True
+    return False
+
+
 def _references_secret(node: Any) -> bool:
-    names = set()
+    """Whether any expression in `node` reads a secret other than the default token.
+
+    The secrets context resolves only inside `${{ }}`, so literal text such
+    as `echo 'secrets.KEY'` is inert.
+    """
     for body in expression_bodies(json.dumps(node, default=str)):
-        expression = normalize(body)
-        names.update(name.lower() for name in _SECRET_DOT.findall(expression))
-        if _SECRET_INDEX.search(expression):
-            names.add("<dynamic>")
-        if _SECRET_CONTEXT.search(expression):
-            names.add("<context>")
-    return bool(names - {"github_token"})
+        try:
+            expression = parse(body)
+        except ExpressionError:
+            # An unreadable expression could name any secret.
+            if _SECRETS_MENTION.search(body):
+                return True
+            continue
+        for path in context_paths(expression):
+            if not path.segments or path.segments[0].lower() != "secrets":
+                continue
+            # A whole-context read — `secrets`, `secrets.*`, a computed key —
+            # exposes every secret, so it can never ride the exemption.
+            if path.dynamic or len(path.segments) == 1 or path.segments[1] == "*":
+                return True
+            if path.segments[1].lower() != _DEFAULT_TOKEN:
+                return True
+    return False
 
 
 def _grants_write(job: dict[str, Any], workflow: WorkflowFile) -> bool:

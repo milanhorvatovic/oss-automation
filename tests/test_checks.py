@@ -761,6 +761,101 @@ class TestTrustModel:
         assert len(findings) == 1
         assert "literal identity" in findings[0]
 
+    def test_spaced_call_around_the_author_path_is_not_a_pin(self) -> None:
+        # Whitespace before the parenthesis still makes this a call, whose
+        # result — not the author path — is what the equality compares.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  hashFiles (github.event.pull_request.user.login) == 'x' &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
+
+    def test_spaced_negation_operators_are_counted(self) -> None:
+        # Three NOT operators separated by whitespace still invert the pin.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  ! !!(github.event.pull_request.user.login == 'dependabot[bot]') &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
+
+    def test_left_hand_boolean_comparison_inverts_the_pin(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  false == (github.event.pull_request.user.login == 'dependabot[bot]') &&
+                  false == (github.event.pull_request.head.repo.full_name == github.repository)
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+    def test_unparseable_condition_pins_nothing(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: "github.event.pull_request.user.login == && ("
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+    def test_condition_wrapped_in_an_expression_is_parsed(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  ${{ github.event.pull_request.user.login == 'dependabot[bot]' &&
+                  github.event.pull_request.head.repo.full_name == github.repository }}
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
     def test_grouped_operands_are_accepted(self) -> None:
         # Redundant parentheses around a bare path do not change the pin.
         parsed = workflow(

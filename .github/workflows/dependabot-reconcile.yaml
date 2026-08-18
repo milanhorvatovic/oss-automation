@@ -1,0 +1,32 @@
+name: Dependabot Reconcile
+
+# Caller of this repository's own Dependabot reconciler — the bounded-latency
+# sweep for dropped events, stalled auto-merge fires, and kill-switch flips.
+# The contract lives in dependabot-reconciler.yaml's header.
+
+on:
+  schedule:
+    - cron: "*/30 * * * *"
+  workflow_dispatch:
+
+# Only the caller can serialize whole sweeps — a called workflow's jobs
+# cannot hold a concurrency group past their own lifetime, and overlapping
+# matrices would double the eviction pressure inside the per-PR groups.
+concurrency:
+  group: dependabot-reconciler
+  cancel-in-progress: false
+
+permissions: {}
+
+jobs:
+  reconcile:
+    # Required verbatim by the callee: a called workflow can only downgrade
+    # the caller's token, never raise it.
+    permissions:
+      contents: read
+      pull-requests: read
+      actions: read
+    uses: milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml@6096e7f31a220c4c7e2a5d9ccfde742858350a18 # main 2026-08-17
+    secrets:
+      automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
+      automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

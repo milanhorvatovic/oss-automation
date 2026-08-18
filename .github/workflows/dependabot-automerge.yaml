@@ -1,0 +1,62 @@
+name: Dependabot Automerge
+
+# Caller of this repository's own Dependabot policy — consumer #1 of the
+# contract documented in dependabot-policy.yaml's header. The `edited`
+# trigger type is load-bearing there: a base retarget emits only `edited`.
+
+on:
+  pull_request:
+    types:
+      - opened
+      - reopened
+      - synchronize
+      - labeled
+      - unlabeled
+      - edited
+
+permissions:
+  contents: read
+  pull-requests: read
+
+jobs:
+  caller:
+    # Trust guards per the policy contract: keyed on the PR author, never
+    # github.actor (the reconciler's branch updates emit synchronize events
+    # whose actor is the App), plus the same-repo head pin.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    uses: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml@6096e7f31a220c4c7e2a5d9ccfde742858350a18 # main 2026-08-17
+    with:
+      # A compromised bump of any of these touches the fleet's trust root:
+      # the fleet home hosts the policy these callers delegate to, one
+      # action mints the App token, the other parses Dependabot metadata
+      # the policy trusts. Their updates are armed but held for a
+      # maintainer — a malicious tag must never ride its own policy to an
+      # auto-merged pin bump.
+      privileged-dependencies: |
+        milanhorvatovic/oss-automation
+        actions/create-github-app-token
+        dependabot/fetch-metadata
+    secrets:
+      automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
+      automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+
+  gate:
+    # The consumer contract's always-run gate: the trust-guarded caller job
+    # skips on non-Dependabot PRs and a skipped job reports as passing, so
+    # this context — not the callee's — is the one the ruleset requires.
+    needs: caller
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Fail on a failed or cancelled policy run
+        env:
+          RESULT: ${{ needs.caller.result }}
+        run: |
+          set -euo pipefail
+          if [[ "$RESULT" == "failure" || "$RESULT" == "cancelled" ]]; then
+            echo "::error::The Dependabot policy run concluded ${RESULT}."
+            exit 1
+          fi
+          echo "Policy result: ${RESULT}."

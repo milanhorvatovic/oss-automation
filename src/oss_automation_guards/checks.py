@@ -19,9 +19,16 @@ _DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
 _VERSION_SHAPED = re.compile(r"\d")
 
 # GitHub expression contexts are case-insensitive, so every pattern below
-# matches that way; expression string literals are single-quoted only.
+# matches that way; expression string literals are single-quoted only. The
+# secrets context resolves only inside ${{ }} bodies (even `if:` values are
+# wrapped implicitly but cannot read secrets), so only expression bodies are
+# scanned — literal text like `echo 'secrets.KEY'` is inert.
+_EXPRESSION = re.compile(r"\$\{\{(.*?)\}\}", re.DOTALL)
 _SECRET_DOT = re.compile(r"\bsecrets\.([A-Za-z0-9_]+)", re.IGNORECASE)
 _SECRET_INDEX = re.compile(r"\bsecrets\s*\[\s*(?:'([^']*)')?", re.IGNORECASE)
+# Bare context use — toJSON(secrets), fromJSON, a naked `secrets` — exposes
+# every secret at once, so it can never ride the GITHUB_TOKEN exemption.
+_SECRET_CONTEXT = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.IGNORECASE)
 
 _PR_TRIGGERS = frozenset({"pull_request", "pull_request_target"})
 _AUTHOR_PIN = "github.event.pull_request.user.login"
@@ -37,7 +44,14 @@ def _equality_pin(path: str) -> re.Pattern[str]:
 # Structural, not semantic — the guard proves an equality on the pin exists,
 # not that it gates the job (`always() || <pin>` still passes).
 _AUTHOR_EQUALITY = _equality_pin(_AUTHOR_PIN)
-_HEAD_REPO_EQUALITY = _equality_pin(_HEAD_REPO_PIN)
+# The head pin must compare against github.repository specifically — an
+# equality with any other operand (a fork literal, another context) would
+# pass a job that runs credentialed on foreign heads.
+_HEAD_REPO_EQUALITY = re.compile(
+    rf"{re.escape(_HEAD_REPO_PIN)}\s*==\s*github\.repository\b"
+    rf"|github\.repository\s*==\s*{re.escape(_HEAD_REPO_PIN)}",
+    re.IGNORECASE,
+)
 # The \b keeps distinct contexts like github.actor_id from matching.
 _ACTOR_REFERENCE = re.compile(r"github\.actor\b", re.IGNORECASE)
 
@@ -49,7 +63,9 @@ def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
             # A reusable-workflow call cannot carry timeout-minutes; the
             # callee's own jobs are where this guard applies.
             continue
-        if "timeout-minutes" not in job:
+        # A bare `timeout-minutes:` is a YAML null — key present, no value —
+        # and leaves the job on the default exactly like a missing key.
+        if job.get("timeout-minutes") is None:
             findings.append(
                 f"job '{job_id}' declares no timeout-minutes; a hung run would hold its"
                 " runner for GitHub's 6-hour default"
@@ -124,8 +140,8 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
             )
         if not _HEAD_REPO_EQUALITY.search(condition):
             findings.append(
-                f"{prefix} but its `if:` does not pin the head repository with an"
-                f" equality on {_HEAD_REPO_PIN}"
+                f"{prefix} but its `if:` does not pin the head repository via"
+                f" {_HEAD_REPO_PIN} == github.repository"
             )
         if _ACTOR_REFERENCE.search(condition):
             findings.append(
@@ -229,11 +245,15 @@ def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile, target_trigg
 
 def _references_secret(node: Any) -> bool:
     serialized = json.dumps(node, default=str)
-    names = {name.lower() for name in _SECRET_DOT.findall(serialized)}
-    for match in _SECRET_INDEX.finditer(serialized):
-        literal = match.group(1)
-        # A dynamic index can name any secret; treat it as credentialed.
-        names.add(literal.lower() if literal is not None else "<dynamic>")
+    names = set()
+    for expression in _EXPRESSION.findall(serialized):
+        names.update(name.lower() for name in _SECRET_DOT.findall(expression))
+        for match in _SECRET_INDEX.finditer(expression):
+            literal = match.group(1)
+            # A dynamic index can name any secret; treat it as credentialed.
+            names.add(literal.lower() if literal is not None else "<dynamic>")
+        if _SECRET_CONTEXT.search(expression):
+            names.add("<context>")
     return bool(names - {"github_token"})
 
 

@@ -16,8 +16,8 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # The oldest supported floor and a current release.
-        python-version: ["3.10", "3.13"]
+        # The oldest supported floor and the current release.
+        python-version: ["3.10", "3.14"]
     steps:
       - name: Check out the repository
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

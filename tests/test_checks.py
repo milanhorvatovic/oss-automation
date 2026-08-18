@@ -62,6 +62,18 @@ class TestTimeouts:
         assert len(findings) == 1
         assert "'build'" in findings[0]
 
+    def test_bare_null_timeout_is_found(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes:
+                steps: []
+            """
+        )
+        assert len(checks.jobs_missing_timeout(parsed)) == 1
+
     def test_reusable_call_job_is_exempt(self) -> None:
         parsed = workflow(
             f"""
@@ -506,7 +518,8 @@ class TestTrustModel:
         )
         findings = checks.unguarded_pr_credentials(parsed)
         assert len(findings) == 2
-        assert all("equality" in finding for finding in findings)
+        assert any("equality" in finding for finding in findings)
+        assert any("github.repository" in finding for finding in findings)
 
     def test_actor_id_is_not_mistaken_for_actor_keying(self) -> None:
         parsed = workflow(
@@ -519,6 +532,52 @@ class TestTrustModel:
                   {TRUSTED_IF} && github.actor_id == 123
                 secrets: inherit
                 uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_head_pin_against_a_literal_repository_is_not_a_trust_guard(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  github.event.pull_request.user.login == 'dependabot[bot]' &&
+                  github.event.pull_request.head.repo.full_name == 'attacker/fork'
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "github.repository" in findings[0]
+
+    def test_whole_secrets_context_is_credentialed(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              dump:
+                steps:
+                  - run: echo '${{ toJSON(secrets) }}'
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) != []
+
+    def test_secret_lookalike_text_outside_expressions_is_ignored(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              docs:
+                steps:
+                  - run: echo 'reference secrets.KEY in your workflow'
             """
         )
         assert checks.unguarded_pr_credentials(parsed) == []

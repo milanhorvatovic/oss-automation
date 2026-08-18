@@ -1,0 +1,246 @@
+"""Pure structural checks over a parsed workflow file.
+
+Each check returns human-readable findings; an empty list means the
+workflow satisfies that guard.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from typing import Any
+
+import yaml
+
+from .model import WorkflowFile
+
+_FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
+_DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
+_VERSION_SHAPED = re.compile(r"\d")
+
+# GitHub expression contexts are case-insensitive, so every pattern below
+# matches that way; expression string literals are single-quoted only.
+_SECRET_DOT = re.compile(r"\bsecrets\.([A-Za-z0-9_]+)", re.IGNORECASE)
+_SECRET_INDEX = re.compile(r"\bsecrets\s*\[\s*(?:'([^']*)')?", re.IGNORECASE)
+
+_PR_TRIGGERS = frozenset({"pull_request", "pull_request_target"})
+_AUTHOR_PIN = "github.event.pull_request.user.login"
+_HEAD_REPO_PIN = "github.event.pull_request.head.repo.full_name"
+
+
+def _equality_pin(path: str) -> re.Pattern[str]:
+    escaped = re.escape(path)
+    return re.compile(rf"{escaped}\s*==|==\s*{escaped}", re.IGNORECASE)
+
+
+# Equality only: a negated or merely-mentioned pin is not a trust guard.
+# Structural, not semantic — the guard proves an equality on the pin exists,
+# not that it gates the job (`always() || <pin>` still passes).
+_AUTHOR_EQUALITY = _equality_pin(_AUTHOR_PIN)
+_HEAD_REPO_EQUALITY = _equality_pin(_HEAD_REPO_PIN)
+# The \b keeps distinct contexts like github.actor_id from matching.
+_ACTOR_REFERENCE = re.compile(r"github\.actor\b", re.IGNORECASE)
+
+
+def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
+    findings = []
+    for job_id, job in workflow.jobs.items():
+        if "uses" in job:
+            # A reusable-workflow call cannot carry timeout-minutes; the
+            # callee's own jobs are where this guard applies.
+            continue
+        if "timeout-minutes" not in job:
+            findings.append(
+                f"job '{job_id}' declares no timeout-minutes; a hung run would hold its"
+                " runner for GitHub's 6-hour default"
+            )
+    return findings
+
+
+def unpinned_uses(workflow: WorkflowFile) -> list[str]:
+    findings = []
+    lines = workflow.text.splitlines()
+    for location, value, lineno in _uses_targets(workflow):
+        if value.startswith("./"):
+            continue
+        if value.startswith("docker://"):
+            if not _DOCKER_DIGEST.search(value):
+                findings.append(f"{location} uses '{value}' without a sha256 digest pin")
+        else:
+            ref = value.partition("@")[2]
+            if not _FULL_COMMIT_SHA.fullmatch(ref):
+                findings.append(
+                    f"{location} uses '{value}', which is not pinned to a full"
+                    " 40-character commit SHA"
+                )
+        comment = _trailing_comment(lines[lineno - 1]) if lineno <= len(lines) else None
+        if comment is None:
+            findings.append(f"line {lineno} pins '{value}' without a trailing version comment")
+        elif not _VERSION_SHAPED.search(comment):
+            findings.append(
+                f"line {lineno} annotates '{value}' with '# {comment}', which does not"
+                " name the pinned version"
+            )
+    return findings
+
+
+def unpinned_permissions(workflow: WorkflowFile) -> list[str]:
+    findings = []
+    workflow_value = workflow.data.get("permissions")
+    findings += _permission_value_findings(
+        "workflow-level", "permissions" in workflow.data, workflow_value
+    )
+    workflow_pinned = _is_scope_pin(workflow_value)
+    for job_id, job in workflow.jobs.items():
+        job_value = job.get("permissions")
+        findings += _permission_value_findings(f"job '{job_id}'", "permissions" in job, job_value)
+        if not workflow_pinned and not _is_scope_pin(job_value):
+            findings.append(
+                f"job '{job_id}' inherits the repository's default token scopes; pin them"
+                " with a `permissions:` block at the workflow or job level"
+            )
+    return findings
+
+
+def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
+    pr_triggers = sorted(set(workflow.triggers) & _PR_TRIGGERS)
+    if not pr_triggers:
+        return []
+    findings = []
+    target_triggered = "pull_request_target" in pr_triggers
+    # A secret in the workflow-level env reaches every job, so it makes the
+    # whole workflow's jobs credentialed, not just the ones referencing it.
+    workflow_credentialed = _references_secret(workflow.data.get("env"))
+    for job_id, job in workflow.jobs.items():
+        if not (workflow_credentialed or _holds_credentials(job, workflow, target_triggered)):
+            continue
+        condition = job.get("if")
+        condition = condition if isinstance(condition, str) else ""
+        prefix = f"job '{job_id}' holds credentials on a {'/'.join(pr_triggers)} trigger"
+        if not _AUTHOR_EQUALITY.search(condition):
+            findings.append(
+                f"{prefix} but its `if:` does not pin the pull-request author with an"
+                f" equality on {_AUTHOR_PIN}"
+            )
+        if not _HEAD_REPO_EQUALITY.search(condition):
+            findings.append(
+                f"{prefix} but its `if:` does not pin the head repository with an"
+                f" equality on {_HEAD_REPO_PIN}"
+            )
+        if _ACTOR_REFERENCE.search(condition):
+            findings.append(
+                f"job '{job_id}' keys trust on github.actor; a synchronize event emitted"
+                " by another actor (e.g. an automation App updating the branch) carries"
+                f" that actor, not the PR author — key on {_AUTHOR_PIN} instead"
+            )
+    return findings
+
+
+def _uses_targets(workflow: WorkflowFile) -> list[tuple[str, str, int]]:
+    """Every `uses:` target as (location, value, 1-based line of the value node).
+
+    Walks the composed YAML node graph instead of scanning raw lines, so text
+    inside comments or `run:` blocks is never mistaken for a step, and folded
+    or quoted scalars resolve to their real value and source line.
+    """
+    targets = []
+    jobs = _mapping_entry(yaml.compose(workflow.text, yaml.SafeLoader), "jobs")
+    if not isinstance(jobs, yaml.MappingNode):
+        return []
+    for job_key, job_node in jobs.value:
+        job_id = job_key.value if isinstance(job_key, yaml.ScalarNode) else "?"
+        job_uses = _mapping_entry(job_node, "uses")
+        if isinstance(job_uses, yaml.ScalarNode):
+            targets.append((f"job '{job_id}'", job_uses.value, job_uses.start_mark.line + 1))
+        steps = _mapping_entry(job_node, "steps")
+        if not isinstance(steps, yaml.SequenceNode):
+            continue
+        for index, step in enumerate(steps.value, start=1):
+            step_uses = _mapping_entry(step, "uses")
+            if isinstance(step_uses, yaml.ScalarNode):
+                targets.append(
+                    (
+                        f"job '{job_id}' step {index}",
+                        step_uses.value,
+                        step_uses.start_mark.line + 1,
+                    )
+                )
+    return targets
+
+
+def _mapping_entry(node: yaml.Node | None, key: str) -> yaml.Node | None:
+    if not isinstance(node, yaml.MappingNode):
+        return None
+    for key_node, value_node in node.value:
+        if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
+            return value_node
+    return None
+
+
+def _trailing_comment(raw_line: str) -> str | None:
+    in_single = in_double = False
+    for index, char in enumerate(raw_line):
+        if char == "'" and not in_double:
+            in_single = not in_single
+        elif char == '"' and not in_single:
+            in_double = not in_double
+        elif (
+            char == "#"
+            and not in_single
+            and not in_double
+            and (index == 0 or raw_line[index - 1] in " \t")
+        ):
+            return raw_line[index + 1 :].strip() or None
+    return None
+
+
+def _permission_value_findings(owner: str, present: bool, value: Any) -> list[str]:
+    if not present:
+        return []
+    if value == "write-all":
+        return [
+            f"{owner} `permissions: write-all` grants every scope; enumerate the scopes instead"
+        ]
+    if value is None:
+        return [
+            f"{owner} bare `permissions:` parses as a YAML null, not the empty scope map;"
+            " write `permissions: {}` or enumerate the scopes"
+        ]
+    return []
+
+
+def _is_scope_pin(value: Any) -> bool:
+    return isinstance(value, dict) or (
+        isinstance(value, str) and value in {"read-all", "write-all"}
+    )
+
+
+def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile, target_triggered: bool) -> bool:
+    if job.get("secrets") == "inherit":
+        return True
+    # A `secrets:` mapping on a reusable-workflow call is covered by the
+    # reference scan below, so passing only the default token stays exempt.
+    if _references_secret(job):
+        return True
+    # On pull_request the token of a fork PR is forced read-only server-side;
+    # only pull_request_target combines untrusted PR context with write scopes.
+    return target_triggered and _grants_write(job, workflow)
+
+
+def _references_secret(node: Any) -> bool:
+    serialized = json.dumps(node, default=str)
+    names = {name.lower() for name in _SECRET_DOT.findall(serialized)}
+    for match in _SECRET_INDEX.finditer(serialized):
+        literal = match.group(1)
+        # A dynamic index can name any secret; treat it as credentialed.
+        names.add(literal.lower() if literal is not None else "<dynamic>")
+    return bool(names - {"github_token"})
+
+
+def _grants_write(job: dict[str, Any], workflow: WorkflowFile) -> bool:
+    permissions = job.get("permissions", workflow.data.get("permissions"))
+    if permissions == "write-all":
+        return True
+    if isinstance(permissions, dict):
+        return "write" in permissions.values()
+    return False

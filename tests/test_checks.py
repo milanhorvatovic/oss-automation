@@ -74,6 +74,32 @@ class TestTimeouts:
         )
         assert len(checks.jobs_missing_timeout(parsed)) == 1
 
+    def test_container_shaped_timeout_is_found(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: []
+                steps: []
+            """
+        )
+        findings = checks.jobs_missing_timeout(parsed)
+        assert len(findings) == 1
+        assert "not a positive number of minutes" in findings[0]
+
+    def test_expression_valued_timeout_passes(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: ${{ inputs.timeout }}
+                steps: []
+            """
+        )
+        assert checks.jobs_missing_timeout(parsed) == []
+
     def test_reusable_call_job_is_exempt(self) -> None:
         parsed = workflow(
             f"""
@@ -334,7 +360,7 @@ class TestPermissions:
         )
         assert checks.unpinned_permissions(parsed) == []
 
-    def test_list_shaped_permissions_do_not_crash(self) -> None:
+    def test_list_shaped_permissions_are_found(self) -> None:
         parsed = workflow(
             """
             permissions: [contents]
@@ -344,7 +370,25 @@ class TestPermissions:
             """
         )
         findings = checks.unpinned_permissions(parsed)
+        assert any("pins no token scopes" in finding for finding in findings)
         assert any("default token scopes" in finding for finding in findings)
+
+    def test_list_shaped_job_permissions_are_found_under_a_valid_workflow_block(self) -> None:
+        # The workflow block satisfies the inheritance check, so the job's
+        # unusable value is only caught by judging the value itself.
+        parsed = workflow(
+            """
+            permissions:
+              contents: read
+            jobs:
+              build:
+                permissions: [contents]
+                steps: []
+            """
+        )
+        findings = checks.unpinned_permissions(parsed)
+        assert len(findings) == 1
+        assert "pins no token scopes" in findings[0]
 
     def test_null_permissions_block_is_found(self) -> None:
         parsed = workflow(
@@ -574,6 +618,45 @@ class TestTrustModel:
             """
         )
         assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_nested_double_negation_still_passes(self) -> None:
+        # !(!(x)) is x; the enclosing-negation count is read modulo two.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  !(!(github.event.pull_request.user.login == 'dependabot[bot]')) &&
+                  !(!(github.event.pull_request.head.repo.full_name == github.repository))
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_triple_negation_is_not_a_trust_guard(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  !(!(!(github.event.pull_request.user.login == 'dependabot[bot]'))) &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
 
     def test_index_syntax_pins_are_accepted(self) -> None:
         parsed = workflow(

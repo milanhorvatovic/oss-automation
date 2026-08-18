@@ -54,13 +54,15 @@ def normalize(expression: str) -> str:
 
 
 def has_unnegated(pattern: re.Pattern[str], expression: str) -> bool:
-    """Whether `pattern` matches outside every negated group.
+    """Whether `pattern` matches in positive sense anywhere.
 
     A pin under `!( ... )` selects the complement of the trusted identity, so
-    a match there is the opposite of the guard it resembles.
+    a match there is the opposite of the guard it resembles. Each enclosing
+    negation flips the sense, so an even count — none, or `!(!( ... ))` —
+    reads as the positive pin it is equivalent to.
     """
     depths = _negation_depths(expression)
-    return any(depths[match.start()] == 0 for match in pattern.finditer(expression))
+    return any(depths[match.start()] % 2 == 0 for match in pattern.finditer(expression))
 
 
 def _past_literal(text: str, start: int) -> int:
@@ -77,7 +79,11 @@ def _past_literal(text: str, start: int) -> int:
 
 
 def _negation_depths(expression: str) -> list[int]:
-    """Per character, how many negated groups enclose it."""
+    """Per character, how many negated groups enclose it.
+
+    The caller reads this modulo two; the raw count is kept so nesting and
+    stacked `!` operators compose.
+    """
     depths = []
     stack: list[bool] = []
     for index, char in enumerate(expression):

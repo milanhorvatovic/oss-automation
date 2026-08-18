@@ -72,12 +72,18 @@ def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
             # A reusable-workflow call cannot carry timeout-minutes; the
             # callee's own jobs are where this guard applies.
             continue
+        timeout = job.get("timeout-minutes")
         # A bare `timeout-minutes:` is a YAML null — key present, no value —
         # and leaves the job on the default exactly like a missing key.
-        if job.get("timeout-minutes") is None:
+        if timeout is None:
             findings.append(
                 f"job '{job_id}' declares no timeout-minutes; a hung run would hold its"
                 " runner for GitHub's 6-hour default"
+            )
+        elif not _is_usable_timeout(timeout):
+            findings.append(
+                f"job '{job_id}' sets timeout-minutes to {timeout!r}, which is not a"
+                " positive number of minutes, so no timeout is imposed"
             )
     return findings
 
@@ -218,6 +224,16 @@ def _trailing_comment(raw_line: str) -> str | None:
     return None
 
 
+def _is_usable_timeout(value: Any) -> bool:
+    # An expression resolves at run time and cannot be judged here; a
+    # container or boolean never denotes minutes.
+    if isinstance(value, str):
+        return bool(value.strip())
+    if isinstance(value, bool):
+        return False
+    return isinstance(value, (int, float)) and value > 0
+
+
 def _permission_value_findings(owner: str, present: bool, value: Any) -> list[str]:
     if not present:
         return []
@@ -230,7 +246,14 @@ def _permission_value_findings(owner: str, present: bool, value: Any) -> list[st
             f"{owner} bare `permissions:` parses as a YAML null, not the empty scope map;"
             " write `permissions: {}` or enumerate the scopes"
         ]
-    return []
+    if _is_scope_pin(value):
+        return []
+    # Anything else — a list, a bare scope name — pins nothing, and silence
+    # here would read as a satisfied guard.
+    return [
+        f"{owner} `permissions: {value!r}` is not a scope map or read-all/write-all,"
+        " so it pins no token scopes"
+    ]
 
 
 def _is_scope_pin(value: Any) -> bool:

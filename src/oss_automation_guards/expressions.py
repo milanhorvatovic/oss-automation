@@ -16,6 +16,9 @@ _STRING_LITERAL = re.compile(r"'(?:[^']|'')*'")
 _INDEX_KEY = re.compile(r"\[\s*'([A-Za-z_][A-Za-z0-9_-]*)'\s*\]")
 # A comparison against a boolean literal, applied to whatever precedes it.
 _BOOLEAN_COMPARISON = re.compile(r"\s*(==|!=)\s*(true|false)\b", re.IGNORECASE)
+# Redundant parentheses around a bare context path. The lookbehind keeps a
+# function call — an identifier immediately before the parenthesis — out.
+_GROUPED_PATH = re.compile(r"(?<![\w.\])])\(\s*([A-Za-z_][A-Za-z0-9_.-]*)\s*\)")
 
 
 def expression_bodies(text: str) -> list[str]:
@@ -50,9 +53,19 @@ def normalize(expression: str) -> str:
     `github['actor']` and `github.actor` are one shape; every remaining
     literal — a value, never a path segment — collapses to `''`, so a pin
     compared against a literal identity is recognizable without knowing which
-    identity, and pin-shaped text inside a literal stops looking like a pin.
+    identity, and pin-shaped text inside a literal stops looking like a pin;
+    and parentheses wrapping nothing but a path are dropped, so `(path) == x`
+    is the same shape as `path == x`. Dropping them cannot change sense —
+    `!(path)` and `!path` are one expression.
     """
-    return _STRING_LITERAL.sub("''", _INDEX_KEY.sub(lambda match: f".{match.group(1)}", expression))
+    normalized = _STRING_LITERAL.sub(
+        "''", _INDEX_KEY.sub(lambda match: f".{match.group(1)}", expression)
+    )
+    previous = None
+    while previous != normalized:
+        previous = normalized
+        normalized = _GROUPED_PATH.sub(r"\1", normalized)
+    return normalized
 
 
 def has_unnegated(pattern: re.Pattern[str], expression: str) -> bool:

@@ -88,6 +88,31 @@ class TestTimeouts:
         assert len(findings) == 1
         assert "not a positive number of minutes" in findings[0]
 
+    @pytest.mark.parametrize("value", ['"0"', "unlimited", '"-5"', '""'])
+    def test_unusable_timeout_strings_are_found(self, value: str) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: {value}
+                steps: []
+            """
+        )
+        assert len(checks.jobs_missing_timeout(parsed)) == 1
+
+    def test_numeric_string_timeout_passes(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                runs-on: ubuntu-latest
+                timeout-minutes: "10"
+                steps: []
+            """
+        )
+        assert checks.jobs_missing_timeout(parsed) == []
+
     def test_expression_valued_timeout_passes(self) -> None:
         parsed = workflow(
             """
@@ -726,6 +751,45 @@ class TestTrustModel:
                 if: >-
                   !(!(!(github.event.pull_request.user.login == 'dependabot[bot]'))) &&
                   github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
+
+    def test_grouped_operands_are_accepted(self) -> None:
+        # Redundant parentheses around a bare path do not change the pin.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  (github.event.pull_request.user.login) == 'dependabot[bot]' &&
+                  (github.event.pull_request.head.repo.full_name) == (github.repository)
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_grouped_operands_under_negation_are_still_rejected(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  !((github.event.pull_request.user.login) == 'dependabot[bot]') &&
+                  (github.event.pull_request.head.repo.full_name) == (github.repository)
                 steps:
                   - run: deploy
                     env:

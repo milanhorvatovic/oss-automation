@@ -231,10 +231,17 @@ def _trailing_comment(raw_line: str) -> str | None:
 
 
 def _is_usable_timeout(value: Any) -> bool:
-    # An expression resolves at run time and cannot be judged here; a
-    # container or boolean never denotes minutes.
+    # A container or boolean never denotes minutes.
     if isinstance(value, str):
-        return bool(value.strip())
+        text = value.strip()
+        # An expression resolves at run time and cannot be judged here; any
+        # other string has to read as a positive number of minutes.
+        if "${{" in text:
+            return True
+        try:
+            return float(text) > 0
+        except ValueError:
+            return False
     if isinstance(value, bool):
         return False
     return isinstance(value, (int, float)) and value > 0

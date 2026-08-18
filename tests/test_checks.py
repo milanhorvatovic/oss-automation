@@ -518,7 +518,7 @@ class TestTrustModel:
         )
         findings = checks.unguarded_pr_credentials(parsed)
         assert len(findings) == 2
-        assert any("equality" in finding for finding in findings)
+        assert any("literal identity" in finding for finding in findings)
         assert any("github.repository" in finding for finding in findings)
 
     def test_actor_id_is_not_mistaken_for_actor_keying(self) -> None:
@@ -535,6 +535,28 @@ class TestTrustModel:
             """
         )
         assert checks.unguarded_pr_credentials(parsed) == []
+
+    def test_author_self_comparison_is_not_a_trust_guard(self) -> None:
+        # login == login is true for every author; only a comparison against
+        # a literal identity counts as the pin.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  github.event.pull_request.user.login == github.event.pull_request.user.login &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
 
     def test_suffixed_pin_identifiers_are_not_a_trust_guard(self) -> None:
         # A longer identifier sharing the pin path as its prefix must not

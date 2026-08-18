@@ -44,8 +44,13 @@ def _delimited(path: str) -> str:
 # Equality only: a negated or merely-mentioned pin is not a trust guard.
 # Structural, not semantic — the guard proves an equality on the pin exists,
 # not that it gates the job (`always() || <pin>` still passes).
+#
+# The author pin must compare against a string literal — the '' placeholder
+# literal-stripping leaves behind — so a tautology (login == login) or a
+# comparison against another dynamic context never counts as an identity pin.
 _AUTHOR_EQUALITY = re.compile(
-    rf"{_delimited(_AUTHOR_PIN)}\s*==|==\s*{_delimited(_AUTHOR_PIN)}", re.IGNORECASE
+    rf"{_delimited(_AUTHOR_PIN)}\s*==\s*''|''\s*==\s*{_delimited(_AUTHOR_PIN)}",
+    re.IGNORECASE,
 )
 # The head pin must compare against github.repository specifically — an
 # equality with any other operand (a fork literal, another context) would
@@ -145,8 +150,8 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
         prefix = f"job '{job_id}' holds credentials on a {'/'.join(pr_triggers)} trigger"
         if not _AUTHOR_EQUALITY.search(condition):
             findings.append(
-                f"{prefix} but its `if:` does not pin the pull-request author with an"
-                f" equality on {_AUTHOR_PIN}"
+                f"{prefix} but its `if:` does not pin the pull-request author by"
+                f" comparing {_AUTHOR_PIN} against a literal identity"
             )
         if not _HEAD_REPO_EQUALITY.search(condition):
             findings.append(

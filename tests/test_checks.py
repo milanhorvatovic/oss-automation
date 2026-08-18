@@ -761,6 +761,56 @@ class TestTrustModel:
         assert len(findings) == 1
         assert "literal identity" in findings[0]
 
+    def test_secret_inside_a_computed_index_is_credentialed(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                steps:
+                  - run: deploy
+                    env:
+                      VALUE: ${{ env[secrets.DEPLOY_TOKEN] }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) != []
+
+    def test_actor_inside_a_computed_index_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF} && vars.allowlist[github.actor] == 'yes'
+                secrets: inherit
+                uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "github.actor" in findings[0]
+
+    def test_uncommon_number_literals_do_not_break_the_pins(self) -> None:
+        # Hexadecimal and exponent literals are valid; failing to lex them
+        # would discard the whole condition and report the pins missing.
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF} && github.run_attempt < 0xff &&
+                  github.run_number > -2.99e-2
+                secrets: inherit
+                uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
     def test_spaced_call_around_the_author_path_is_not_a_pin(self) -> None:
         # Whitespace before the parenthesis still makes this a call, whose
         # result — not the author path — is what the equality compares.

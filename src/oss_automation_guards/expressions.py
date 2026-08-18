@@ -28,7 +28,7 @@ _TOKEN = re.compile(
     r"""
       (?P<space>\s+)
     | (?P<string>'(?:[^']|'')*')
-    | (?P<number>-?\d+(?:\.\d+)?)
+    | (?P<number>-?(?:0[xX][0-9a-fA-F]+|\d+(?:\.\d+)?(?:[eE][+-]?\d+)?))
     | (?P<name>[A-Za-z_][A-Za-z0-9_-]*)
     | (?P<operator>==|!=|<=|>=|&&|\|\||[()\[\].,*!<>])
     """,
@@ -53,16 +53,22 @@ class Value:
 class ContextPath:
     """A context dereference such as `github.event.pull_request.user.login`.
 
-    `dynamic` marks a path with a computed segment, whose full identity is
-    only known at run time.
+    `indices` holds the expressions of any computed segment — `env[name]` —
+    which are kept rather than collapsed, both because such a path's full
+    identity is unknown until run time and because the index itself may
+    dereference a context the guards care about.
     """
 
     segments: tuple[str, ...]
-    dynamic: bool = False
+    indices: tuple[Node, ...] = ()
 
     @property
     def dotted(self) -> str:
         return ".".join(self.segments)
+
+    @property
+    def dynamic(self) -> bool:
+        return bool(self.indices)
 
 
 @dataclass(frozen=True)
@@ -88,6 +94,7 @@ class Access:
     """A dereference of something other than a context path — `f(x).y`."""
 
     base: Node
+    index: Node | None = None
 
 
 Node = Value | ContextPath | FunctionCall | Negation | Operation | Access
@@ -186,10 +193,15 @@ def _collect_equalities(node: Node, inverted: bool, found: list[tuple[Node, Node
 def _collect_paths(node: Node, found: list[ContextPath]) -> None:
     if isinstance(node, ContextPath):
         found.append(node)
+        # A computed segment can itself read a context the guards care about.
+        for index in node.indices:
+            _collect_paths(index, found)
     elif isinstance(node, Negation):
         _collect_paths(node.operand, found)
     elif isinstance(node, Access):
         _collect_paths(node.base, found)
+        if node.index is not None:
+            _collect_paths(node.index, found)
     elif isinstance(node, Operation):
         _collect_paths(node.left, found)
         _collect_paths(node.right, found)
@@ -211,6 +223,15 @@ def _past_literal(text: str, start: int) -> int:
     return len(text)
 
 
+def _number_value(text: str) -> float:
+    """The value of any number literal GitHub accepts, hexadecimal included."""
+    sign = -1.0 if text.startswith("-") else 1.0
+    digits = text.lstrip("+-")
+    if digits[:2].lower() == "0x":
+        return sign * int(digits, 16)
+    return sign * float(digits)
+
+
 def _tokenize(expression: str) -> list[tuple[str, object]]:
     tokens: list[tuple[str, object]] = []
     position = 0
@@ -226,7 +247,7 @@ def _tokenize(expression: str) -> list[tuple[str, object]]:
         if kind == "string":
             tokens.append(("string", text[1:-1].replace("''", "'")))
         elif kind == "number":
-            tokens.append(("number", float(text)))
+            tokens.append(("number", _number_value(text)))
         elif kind == "name" and text.lower() in {"true", "false"}:
             tokens.append(("bool", text.lower() == "true"))
         else:
@@ -268,10 +289,11 @@ class _Parser:
     def parse_postfix(self, node: Node) -> Node:
         while True:
             if self._take_operator("."):
-                node = self._extend(node, self._read_segment())
+                node = self._extend_segment(node, self._read_segment())
             elif self._take_operator("["):
-                node = self._extend(node, self._read_index())
+                index = self.parse_or()
                 self._expect_operator("]")
+                node = self._extend_index(node, index)
             else:
                 return node
 
@@ -313,18 +335,19 @@ class _Parser:
             return "true" if value else "false"
         raise ExpressionError(f"unexpected path segment {value!r}")
 
-    def _read_index(self) -> str | None:
-        node = self.parse_or()
-        if isinstance(node, Value) and node.kind == "string":
-            return str(node.value)
-        return None
-
-    def _extend(self, node: Node, segment: str | None) -> Node:
+    def _extend_segment(self, node: Node, segment: str) -> Node:
         if not isinstance(node, ContextPath):
             return Access(node)
-        if segment is None:
-            return ContextPath(node.segments, dynamic=True)
-        return ContextPath((*node.segments, segment), dynamic=node.dynamic)
+        return ContextPath((*node.segments, segment), node.indices)
+
+    def _extend_index(self, node: Node, index: Node) -> Node:
+        # A literal key is the indexed spelling of a dot segment, so both
+        # forms of one path produce one shape.
+        if isinstance(index, Value) and index.kind == "string":
+            return self._extend_segment(node, str(index.value))
+        if not isinstance(node, ContextPath):
+            return Access(node, index)
+        return ContextPath(node.segments, (*node.indices, index))
 
     def _next(self) -> tuple[str, object]:
         if self._position >= len(self._tokens):

@@ -59,10 +59,15 @@ def has_unnegated(pattern: re.Pattern[str], expression: str) -> bool:
     A pin under `!( ... )` selects the complement of the trusted identity, so
     a match there is the opposite of the guard it resembles. Each enclosing
     negation flips the sense, so an even count — none, or `!(!( ... ))` —
-    reads as the positive pin it is equivalent to.
+    reads as the positive pin it is equivalent to. A `!` bound directly to
+    the matched operand counts the same way: `!` binds tighter than `==`, so
+    `!path == 'x'` compares a negated operand, never the path itself.
     """
     depths = _negation_depths(expression)
-    return any(depths[match.start()] % 2 == 0 for match in pattern.finditer(expression))
+    return any(
+        (depths[match.start()] + _bang_parity(expression, match.start())) % 2 == 0
+        for match in pattern.finditer(expression)
+    )
 
 
 def _past_literal(text: str, start: int) -> int:
@@ -78,6 +83,12 @@ def _past_literal(text: str, start: int) -> int:
     return len(text)
 
 
+def _bang_parity(expression: str, index: int) -> int:
+    """Whether an odd number of `!` operators binds to the token at `index`."""
+    preceding = expression[:index].rstrip()
+    return (len(preceding) - len(preceding.rstrip("!"))) % 2
+
+
 def _negation_depths(expression: str) -> list[int]:
     """Per character, how many negated groups enclose it.
 
@@ -88,10 +99,8 @@ def _negation_depths(expression: str) -> list[int]:
     stack: list[bool] = []
     for index, char in enumerate(expression):
         if char == "(":
-            preceding = expression[:index].rstrip()
             # Parity, so `!!(x)` reads as the no-op it is.
-            bangs = len(preceding) - len(preceding.rstrip("!"))
-            stack.append(bangs % 2 == 1)
+            stack.append(_bang_parity(expression, index) == 1)
         depths.append(sum(stack))
         if char == ")" and stack:
             stack.pop()

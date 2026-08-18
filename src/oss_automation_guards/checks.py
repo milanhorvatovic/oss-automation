@@ -26,9 +26,11 @@ _SECRET_DOT = re.compile(r"\bsecrets\.([A-Za-z0-9_]+)", re.IGNORECASE)
 # Only a dynamic key survives normalization as an index; it can name any
 # secret, so it counts as credentialed.
 _SECRET_INDEX = re.compile(r"\bsecrets\s*\[", re.IGNORECASE)
-# Bare context use — toJSON(secrets), fromJSON, a naked `secrets` — exposes
-# every secret at once, so it can never ride the GITHUB_TOKEN exemption.
-_SECRET_CONTEXT = re.compile(r"\bsecrets\b(?!\s*[.\[])", re.IGNORECASE)
+# Whole-context use — toJSON(secrets), the secrets.* object filter, a naked
+# `secrets` — exposes every secret at once, so it can never ride the
+# GITHUB_TOKEN exemption. Anything that is not a named property or an index
+# dereferences the context as a whole.
+_SECRET_CONTEXT = re.compile(r"\bsecrets\b(?!\s*(?:\[|\.\s*[A-Za-z_]))", re.IGNORECASE)
 
 _PR_TRIGGERS = frozenset({"pull_request", "pull_request_target"})
 _AUTHOR_PIN = "github.event.pull_request.user.login"

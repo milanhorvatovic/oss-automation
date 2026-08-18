@@ -767,6 +767,62 @@ class TestTrustModel:
         )
         assert checks.unguarded_pr_credentials(parsed) != []
 
+    def test_object_filter_over_the_secrets_context_is_credentialed(self) -> None:
+        # secrets.* dereferences every secret at once, so it can never ride
+        # the GITHUB_TOKEN exemption.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              dump:
+                steps:
+                  - run: echo '${{ toJSON(secrets.*) }}'
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) != []
+
+    def test_directly_negated_author_operand_is_not_a_trust_guard(self) -> None:
+        # `!` binds tighter than `==`, so this compares a negated operand,
+        # never the author path itself.
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: >-
+                  !github.event.pull_request.user.login == 'dependabot[bot]' &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "literal identity" in findings[0]
+
+    def test_negation_on_an_unrelated_call_leaves_the_pins_intact(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  !contains(github.event.pull_request.labels.*.name, 'hold') &&
+                  github.event.pull_request.user.login == 'dependabot[bot]' &&
+                  github.event.pull_request.head.repo.full_name == github.repository
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
     def test_secret_lookalike_text_outside_expressions_is_ignored(self) -> None:
         parsed = workflow(
             """

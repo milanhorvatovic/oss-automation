@@ -37,6 +37,7 @@ _AUTHOR_PIN = "github.event.pull_request.user.login"
 _HEAD_REPO_PIN = "github.event.pull_request.head.repo.full_name"
 _REPOSITORY = "github.repository"
 _ACTOR = "github.actor"
+_GITHUB_CONTEXT = "github"
 _DEFAULT_TOKEN = "github_token"
 
 
@@ -148,6 +149,12 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
                 f"job '{job_id}' keys trust on github.actor; a synchronize event emitted"
                 " by another actor (e.g. an automation App updating the branch) carries"
                 f" that actor, not the PR author — key on {_AUTHOR_PIN} instead"
+            )
+        elif any(_may_reach_actor(path) for path in paths):
+            findings.append(
+                f"job '{job_id}' dereferences the github context with a computed key,"
+                " which this guard cannot resolve; if it names 'actor', the job keys"
+                f" trust on the event actor rather than on {_AUTHOR_PIN}"
             )
     return findings
 
@@ -272,6 +279,22 @@ def _holds_credentials(job: dict[str, Any], workflow: WorkflowFile) -> bool:
 def _is_path(node: Any, dotted: str) -> bool:
     return (
         isinstance(node, ContextPath) and not node.dynamic and node.dotted.lower() == dotted.lower()
+    )
+
+
+def _may_reach_actor(node: Any) -> bool:
+    """Whether a computed dereference of the github context could name `actor`.
+
+    `github[format('{0}', 'actor')]` resolves to `github.actor` only at run
+    time, so the guard reports what it cannot rule out instead of reading a
+    key it cannot see. Statically resolvable keys are deliberately not
+    constant-folded: the conservative answer covers them too.
+    """
+    return (
+        isinstance(node, ContextPath)
+        and node.dynamic
+        and bool(node.segments)
+        and node.segments[0].lower() == _GITHUB_CONTEXT
     )
 
 

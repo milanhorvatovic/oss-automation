@@ -793,6 +793,40 @@ class TestTrustModel:
         assert len(findings) == 1
         assert "github.actor" in findings[0]
 
+    def test_computed_github_dereference_is_reported(self) -> None:
+        # github[format('{0}', 'actor')] resolves to github.actor only at run
+        # time; the guard reports what it cannot rule out.
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF} && github[format('{{0}}', 'actor')] == 'dependabot[bot]'
+                secrets: inherit
+                uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        findings = checks.unguarded_pr_credentials(parsed)
+        assert len(findings) == 1
+        assert "computed key" in findings[0]
+
+    def test_computed_dereference_of_another_context_is_not_reported(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF} && vars.allowlist[inputs.name] == 'yes'
+                secrets: inherit
+                uses: owner/repo/.github/workflows/callee.yaml@main
+            """
+        )
+        assert checks.unguarded_pr_credentials(parsed) == []
+
     def test_uncommon_number_literals_do_not_break_the_pins(self) -> None:
         # Hexadecimal and exponent literals are valid; failing to lex them
         # would discard the whole condition and report the pins missing.

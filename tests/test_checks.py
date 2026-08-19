@@ -793,6 +793,41 @@ class TestTrustModel:
         assert len(findings) == 1
         assert "github.actor" in findings[0]
 
+    def test_partially_wrapped_condition_pins_nothing(self) -> None:
+        # Actions substitutes the expression result into a string here, and a
+        # non-empty string is truthy, so the pins gate nothing.
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: "${{{{ {TRUSTED_IF} }}}} && false"
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{{{ secrets.DEPLOY_TOKEN }}}}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+    def test_two_wrapped_expressions_in_one_condition_pin_nothing(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request:
+            jobs:
+              deploy:
+                if: "${{ github.event.pull_request.user.login == 'dependabot[bot]' }}
+                  ${{ github.event.pull_request.head.repo.full_name == github.repository }}"
+                steps:
+                  - run: deploy
+                    env:
+                      TOKEN: ${{ secrets.DEPLOY_TOKEN }}
+            """
+        )
+        assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
     def test_computed_github_dereference_is_reported(self) -> None:
         # github[format('{0}', 'actor')] resolves to github.actor only at run
         # time; the guard reports what it cannot rule out.

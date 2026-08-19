@@ -126,12 +126,19 @@ def expression_bodies(text: str) -> list[str]:
 
 
 def parse_condition(text: str) -> Node:
-    """Parse a job `if:` value, whose `${{ }}` wrapper is optional."""
+    """Parse a job `if:` value, whose `${{ }}` wrapper is optional.
+
+    The wrapper is only unwrapped when it spans the whole scalar. A partial
+    wrapper — `${{ … }} && false`, or two expressions with text between —
+    makes Actions substitute the results into a string, and a non-empty
+    string is truthy however its parts evaluate, so the condition gates
+    nothing. Such a scalar is left as it stands and fails to parse, which
+    the guards read as pinning nothing.
+    """
     stripped = text.strip()
-    if stripped.startswith("${{"):
-        bodies = expression_bodies(stripped)
-        if len(bodies) == 1:
-            stripped = bodies[0]
+    bodies = expression_bodies(stripped)
+    if len(bodies) == 1 and stripped == f"${{{{{bodies[0]}}}}}":
+        return parse(bodies[0])
     return parse(stripped)
 
 

@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "oss-automation-guards"
+version = "0.1.0"
+description = "Structural pytest guards a repository runs against its own GitHub Actions workflow tree."
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+authors = [{ name = "Milan Horvatovič" }]
+dependencies = [
+  "pytest>=8",
+  "PyYAML>=6",
+]
+
+# Exact pins so CI is reproducible and Dependabot's pip updates bump them;
+# the runtime dependencies above stay ranges because this is a library.
+[project.optional-dependencies]
+dev = [
+  "ruff==0.16.3",
+]
+
+[project.entry-points.pytest11]
+oss_automation_guards = "oss_automation_guards.plugin"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/oss_automation_guards"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+
+[tool.ruff]
+target-version = "py310"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B", "SIM", "RUF"]

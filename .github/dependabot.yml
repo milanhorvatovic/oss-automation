@@ -1,0 +1,12 @@
+version: 2
+updates:
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+  # Bumps the exact-pinned dev tools in pyproject.toml; the runtime
+  # dependency ranges are left to widen only when the floor demands it.
+  - package-ecosystem: pip
+    directory: /
+    schedule:
+      interval: weekly

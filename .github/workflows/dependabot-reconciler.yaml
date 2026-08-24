@@ -853,6 +853,10 @@ jobs:
                   # base since (or a dropped retarget delivery) makes
                   # this verdict obsolete; anything unreadable or
                   # mismatched stays suspect.
+                  # ref goes through -f so gh URL-encodes it: this read
+                  # resolves a branch name, and branch names may legally
+                  # carry '#', '&', or '+', which inline in the query
+                  # string would make this trust check read the wrong ref.
                   if trust_base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') \
                     && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base" --jq '.sha') \
                     && trust_head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$VERIFIED_HEAD" --jq '.sha') \
@@ -1431,10 +1435,6 @@ jobs:
               # arriving through the clock rather than through the files.
               # The live check before the POST holds this SHA to account.
               base_sha=$(jq -r '.baseRefOid' <<<"$base_state")
-              # ref goes through -f so gh URL-encodes it: branch names
-              # may legally carry '#', '&', or '+', which inline in the
-              # query string would make this trust check read the wrong
-              # ref.
               if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_sha" --jq '.sha'); then
                 echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
@@ -1447,22 +1447,15 @@ jobs:
                 echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
                 exit 0
               fi
-              # The parity above pins what a re-run executes only for as
-              # long as the caller pins its callee. A `uses: ./…`
-              # delegation names a file that moves independently of the
-              # caller, so an untouched caller can still re-run a policy
-              # that the base branch has since replaced — the same
-              # obsolete-rules re-run this check exists to refuse, arriving
-              # through the other half of the definition.
-              #
-              # Only the local form needs this. A pinned callee is frozen
-              # at its pin, and a re-run applying that pin is applying the
-              # configuration the caller asked for; holding it to the base
-              # branch's current policy would refuse a re-drive for a
-              # divergence that is deliberate. So the caller is read as it
-              # stands at the verified head, and the extra parity applies
-              # only when it delegates locally to a policy inside this
-              # repository.
+              # The parity above settles the caller, and with it any
+              # callee the caller named by commit: such a name cannot move
+              # without the caller file moving. It settles nothing about a
+              # callee that resolves through a ref — a local `./`
+              # delegation, a branch, a tag — because that target moves on
+              # its own, so an untouched caller can still re-run a policy
+              # the base branch has since replaced. That is the same
+              # obsolete-rules re-run this check refuses, arriving through
+              # the other half of the definition.
               policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
               if [[ "$policy_path" != "$POLICY_WORKFLOW" ]]; then
                 # The run is asked what it loaded, rather than the caller

@@ -315,29 +315,34 @@ class TestUsesPinning:
         assert len(findings) == 1
         assert "does not name the pinned version" in findings[0]
 
-    def test_bare_date_comment_is_found(self) -> None:
+    @pytest.mark.parametrize(
+        "comment",
+        ["v7", "3.20", "3.20-alpine", "v1.2.3-rc.1", "v1.2.3-alpha-beta", "v1.2.3-rc.1+build.5"],
+    )
+    def test_version_shaped_comments_pass(self, comment: str) -> None:
         parsed = workflow(
             f"""
             jobs:
               build:
                 steps:
-                  - uses: actions/checkout@{SHA} # 2026-08-17
+                  - uses: actions/checkout@{SHA} # {comment}
+            """
+        )
+        assert checks.unpinned_uses(parsed) == []
+
+    @pytest.mark.parametrize("comment", ["2026-08-17", "v1.2.3-...", "v1.2.3-", "v1.2.3-rc..1"])
+    def test_non_version_comments_are_found(self, comment: str) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA} # {comment}
             """
         )
         findings = checks.unpinned_uses(parsed)
         assert len(findings) == 1
         assert "does not name the pinned version" in findings[0]
-
-    def test_prerelease_version_comment_passes(self) -> None:
-        parsed = workflow(
-            f"""
-            jobs:
-              build:
-                steps:
-                  - uses: actions/checkout@{SHA} # v1.2.3-rc.1
-            """
-        )
-        assert checks.unpinned_uses(parsed) == []
 
 
 class TestPermissions:

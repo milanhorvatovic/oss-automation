@@ -47,11 +47,14 @@ name: Dependabot Reconciler
 # write) enables the failed-policy-run re-drive; every other path works
 # without that grant. That re-drive refuses to re-run a definition the
 # base branch has moved past: the caller workflow is held to blob parity
-# between the verified head and base, and a caller that delegates to this
-# repository's policy through a local `./` reference has that policy file
-# held to the same parity, since a local callee moves without the caller
-# changing. A pinned callee is exempt by design — it is frozen at its pin,
-# and a re-run applying it is applying what the caller asked for. The policy caller's trust guards must key on the
+# between the verified head and the base tip — read at that tip's SHA, not
+# through the branch name, and re-checked against the live tip before the
+# rerun POST — and when the policy this sweep looks for lives in the
+# calling repository, its file is held to the same parity unless the
+# caller is proved to pin it. A pin is exempt by design: frozen at its
+# pin, a re-run applies the configuration the caller asked for. A
+# delegation that cannot be read as a pin takes the parity rather than
+# skipping it, since the reader is a line match and a caller is YAML. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -146,8 +149,8 @@ on:
           basename alone would also match another repository's similarly
           named workflow. Override only when the fleet home is a fork of
           this repository. When this names a workflow inside the calling
-          repository and the caller delegates to it locally, the re-drive
-          also holds that file to base parity — see the re-drive note in
+          repository, the re-drive also holds that file to base parity
+          unless the caller is proved to pin it — see the re-drive note in
           the header.
         required: false
         type: string
@@ -1407,15 +1410,25 @@ jobs:
               # definition in that window was authored on the protected
               # base branch, so the residual is maintainer config drift,
               # not a trust-boundary breach.
-              if ! base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName'); then
+              if ! base_state=$(gh pr view "$PR_NUMBER" --json baseRefName,baseRefOid); then
                 echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
+              base_ref=$(jq -r '.baseRefName' <<<"$base_state")
+              # The parity reads below take the base tip's SHA, not the
+              # branch name that points at it. A branch name resolves to
+              # whatever it holds at the moment of the read, so a merge
+              # landing between these reads and the rerun POST would leave
+              # parity attesting to a definition the base branch no longer
+              # has — the same obsolete-rules re-run this check refuses,
+              # arriving through the clock rather than through the files.
+              # The live check before the POST holds this SHA to account.
+              base_sha=$(jq -r '.baseRefOid' <<<"$base_state")
               # ref goes through -f so gh URL-encodes it: branch names
               # may legally carry '#', '&', or '+', which inline in the
               # query string would make this trust check read the wrong
               # ref.
-              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_ref" --jq '.sha'); then
+              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_sha" --jq '.sha'); then
                 echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
@@ -1467,17 +1480,46 @@ jobs:
                   -e "s@^[[:space:]]*uses:[[:space:]]*'([^']*)'.*@\1@p" \
                   -e 's@^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*@\1@p' \
                   <<<"$caller_source")
-                if grep -qxF "./${policy_path}" <<<"$delegations"; then
-                  if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_ref" --jq '.sha'); then
-                    echo "::warning::Failed to read the locally referenced policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
+                # Classified by what can be proved rather than by what is
+                # absent, because these expressions are line matches and a
+                # caller is YAML: `uses :` carries a legal space before the
+                # colon, a folded scalar puts the value on the next line,
+                # and neither is lifted here. Skipping the parity on a
+                # delegation that could not be read would be this check
+                # failing open on exactly the callers whose formatting it
+                # did not anticipate. So a pin — the one form the parity
+                # must not apply to, since a pinned policy is frozen at its
+                # pin and re-running it applies what the caller asked for —
+                # is what has to be proved, and everything else takes the
+                # check. A hold costs one sweep and the next event re-drives;
+                # a skip re-runs a policy the base branch has replaced.
+                pinned=false
+                while IFS= read -r delegation; do
+                  case "$delegation" in
+                    "${POLICY_WORKFLOW}@"*)
+                      pinned=true
+                      break
+                      ;;
+                  esac
+                done <<<"$delegations"
+                if [[ "$pinned" == "true" ]]; then
+                  echo "The caller pins ${POLICY_WORKFLOW}; the caller parity above already covers what its re-run would execute."
+                else
+                  if grep -qxF "./${policy_path}" <<<"$delegations"; then
+                    echo "The caller delegates to ${policy_path} locally; holding it to the same parity as the caller."
+                  else
+                    echo "::notice::The caller's delegation to ${POLICY_WORKFLOW} could not be classified as pinned; holding the policy to the caller's parity rather than assuming a pin."
+                  fi
+                  if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_sha" --jq '.sha'); then
+                    echo "::warning::Failed to read the policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                     exit 0
                   fi
                   if ! head_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$VERIFIED_HEAD" --jq '.sha'); then
-                    echo "::warning::Failed to read the locally referenced policy workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
+                    echo "::warning::Failed to read the policy workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
                     exit 0
                   fi
                   if [[ "$base_policy_blob" != "$head_policy_blob" ]]; then
-                    echo "::notice::The locally referenced policy workflow ${policy_path} changed since run ${target} (its re-run would execute the old policy); leaving the approval to a fresh event under the current contract."
+                    echo "::notice::The policy workflow ${policy_path} changed since run ${target} (its re-run would execute the old policy); leaving the approval to a fresh event under the current contract."
                     exit 0
                   fi
                 fi
@@ -1489,14 +1531,19 @@ jobs:
               # retarget's fresh `edited` policy run can itself be
               # displaced from that slot, so the parity just verified
               # could still belong to the old base.
-              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName); then
+              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName,baseRefOid); then
                 echo "::warning::Failed to re-read the PR before the re-run; leaving the re-drive to the next sweep."
                 exit 0
               fi
               live_head=$(jq -r '.headRefOid' <<<"$live_pr")
               live_base=$(jq -r '.baseRefName' <<<"$live_pr")
+              live_base_sha=$(jq -r '.baseRefOid' <<<"$live_pr")
               if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
                 echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); that event's policy run owns the new head."
+                exit 0
+              fi
+              if [[ "$live_base_sha" != "$base_sha" ]]; then
+                echo "The base branch advanced (${base_sha} -> ${live_base_sha}) after the parity checks read it; the definition they attested to may no longer be the base's, so the re-drive waits for the next sweep."
                 exit 0
               fi
               if [[ "$live_base" != "$base_ref" ]]; then

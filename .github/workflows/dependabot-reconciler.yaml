@@ -930,6 +930,23 @@ jobs:
             enforce_disarm "a veto label arrived during the trust check"
             exit 0
           fi
+          # The base snapshot the trust check validated against predates
+          # this mutation for the same reason the veto snapshot did, and
+          # goes stale the same way: a merge landing meanwhile can replace
+          # the policy that green verdict was reached under, and nothing
+          # read so far would show it. Only the trust path sets this, so
+          # only a certification resting on that path is held to it. A
+          # stand-down here costs one sweep; the next re-reads everything.
+          if [[ -n "${trust_base_sha:-}" ]]; then
+            if ! live_base_sha=$(gh pr view "$PR_NUMBER" --json baseRefOid --jq '.baseRefOid'); then
+              echo "::error::Failed to re-read PR #${PR_NUMBER}'s base tip after the trust check; refusing to mutate blind."
+              exit 1
+            fi
+            if [[ "$live_base_sha" != "$trust_base_sha" ]]; then
+              echo "The base branch advanced (${trust_base_sha} -> ${live_base_sha}) after the trust check read it, so the policy that verdict was reached under may already be superseded; leaving the approval to the next sweep."
+              exit 0
+            fi
+          fi
           # Deliberately after the trust check: an already-armed squash
           # PR must not be certified verified-armed — which feeds the
           # branch-update step — under an approval the check would have

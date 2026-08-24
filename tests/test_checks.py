@@ -303,6 +303,42 @@ class TestUsesPinning:
         assert len(findings) == 1
         assert "does not name the pinned version" in findings[0]
 
+    def test_branch_and_date_comment_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              call:
+                uses: owner/repo/.github/workflows/callee.yaml@{SHA} # main 2026-08-17
+            """
+        )
+        findings = checks.unpinned_uses(parsed)
+        assert len(findings) == 1
+        assert "does not name the pinned version" in findings[0]
+
+    def test_bare_date_comment_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA} # 2026-08-17
+            """
+        )
+        findings = checks.unpinned_uses(parsed)
+        assert len(findings) == 1
+        assert "does not name the pinned version" in findings[0]
+
+    def test_prerelease_version_comment_passes(self) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA} # v1.2.3-rc.1
+            """
+        )
+        assert checks.unpinned_uses(parsed) == []
+
 
 class TestPermissions:
     def test_workflow_level_block_passes(self) -> None:

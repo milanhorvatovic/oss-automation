@@ -46,24 +46,22 @@ name: Dependabot Reconciler
 # Optional: granting the App the Actions repository permission (read and
 # write) enables the failed-policy-run re-drive; every other path works
 # without that grant. That re-drive refuses to re-run a definition the
-# base branch has moved past: the caller workflow is held to blob parity
+# base branch has moved past. The caller workflow is held to blob parity
 # between the verified head and the base tip — read at that tip's SHA, not
 # through the branch name, and re-checked against the live tip before the
-# rerun POST — and when the policy this sweep looks for lives in the
-# calling repository, its file is held to the same parity unless the
-# caller is proved to pin it. A pin is exempt by design: frozen at its
-# pin, a re-run applies the configuration the caller asked for. A
-# delegation decides which of three answers applies. A pin — a full commit
-# SHA, the criterion the guard test-pack applies to every `uses:` in a
-# tree — is exempt, since a re-run applies the configuration the caller
-# asked for. A local reference takes the parity, because the file this
-# repository holds is the file that re-runs. Any other remote ref stands
-# the re-drive down: a branch or a movable tag resolves to a copy that is
-# neither base's nor head's, so comparing those two would attest to
-# nothing. Delegations are read from the parsed caller, so `uses:` text
-# inside a run: block cannot grant an exemption, and a caller that cannot
-# be read takes the parity rather than losing the re-drive to a missing
-# parser. The policy caller's trust guards must key on the
+# rerun POST — which settles the caller and, with it, any callee the
+# caller pins by commit. What a pin cannot settle is a callee that moves
+# on its own, so when the policy this sweep looks for lives in the calling
+# repository, the run's own record of what it loaded decides: each callee
+# carries the commit it came from and the ref that chose it, a commit the
+# caller named carrying no ref at all. A callee loaded through a ref — a
+# local `./` reference resolving to the pull request's merge commit, a
+# branch, a tag — is compared against the base tip's copy of that file,
+# and a difference stands the re-drive down. Reading the run rather than
+# the caller is deliberate: a re-run replays this run's definition, so its
+# entries are what would execute, and nothing has to be inferred from
+# delegation syntax, from `uses:` text inside a run: block, or from which
+# job happens to come first. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -158,10 +156,9 @@ on:
           basename alone would also match another repository's similarly
           named workflow. Override only when the fleet home is a fork of
           this repository. When this names a workflow inside the calling
-          repository, the re-drive holds that file to base parity when the
-          caller delegates to it locally, exempts it when the caller pins
-          it at a commit, and stands down when the caller names a movable
-          ref — see the re-drive note in the header.
+          repository, the re-drive compares the copy the run actually
+          loaded against the base tip's, exempting only a callee the
+          caller named by commit — see the re-drive note in the header.
         required: false
         type: string
         default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
@@ -1468,93 +1465,47 @@ jobs:
               # repository.
               policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
               if [[ "$policy_path" != "$POLICY_WORKFLOW" ]]; then
-                if ! caller_source=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$VERIFIED_HEAD" -H "Accept: application/vnd.github.raw+json"); then
-                  echo "::warning::Failed to read the caller workflow's contents at the verified head; skipping the re-drive rather than re-running a configuration whose callee could not be identified."
+                # The run is asked what it loaded, rather than the caller
+                # being read and the answer inferred from it. Each run
+                # records, per callee, the commit it came from and the ref
+                # that chose it: a commit pin carries no ref at all, a
+                # branch or tag carries its refs/heads or refs/tags name,
+                # and a local `./` reference carries the pull request's
+                # merge ref. A re-run replays this run's definition, so
+                # these entries are exactly what would execute — no
+                # delegation syntax to parse, no `uses:` in a run: block to
+                # mistake for one, and no job order to pick a winner from.
+                if ! policy_entries=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${target}" \
+                  --jq '.referenced_workflows[]? | select(.path | startswith(env.POLICY_WORKFLOW + "@")) | [(.ref // ""), .sha] | @tsv'); then
+                  echo "::warning::Failed to read run ${target}'s referenced workflows; skipping the re-drive rather than re-running a configuration whose policy could not be identified."
                   exit 0
                 fi
-                # Read from the parsed document, not from the text. A
-                # line match cannot tell a `uses:` key from the same
-                # characters inside a run: block, and it misses the forms
-                # YAML allows a key to take — a space before the colon, a
-                # folded scalar, quotes. Both directions matter here: text
-                # in a scalar must not grant the pin exemption, and a
-                # delegation written unusually must not be invisible.
-                # When nothing can be parsed — a runner without PyYAML, a
-                # caller that does not load — the list stays empty, which
-                # proves no pin, which applies the parity. Unreadable and
-                # unproven are the same answer to this step.
-                caller_file=$(mktemp)
-                printf '%s' "$caller_source" >"$caller_file"
-                if ! delegations=$(python3 -c "import sys, yaml; document = yaml.safe_load(open(sys.argv[1], encoding='utf-8')) or {}; jobs = document.get('jobs') or {}; print('\n'.join(job['uses'].strip() for job in jobs.values() if isinstance(job, dict) and isinstance(job.get('uses'), str)))" "$caller_file" 2>/dev/null); then
-                  delegations=""
-                  echo "::notice::The caller workflow's delegations could not be read from its structure; holding the policy to the caller's parity rather than assuming a pin."
-                fi
-                rm -f "$caller_file"
-                # Three answers, and the delegation decides which. A pin
-                # exempts: frozen at a commit, its re-run applies the
-                # configuration the caller asked for, and the caller parity
-                # above already covers the pin itself. A local reference
-                # takes the parity: the file this repository holds is the
-                # file that re-runs, so base and head copies are the right
-                # two things to compare. Anything else stands the re-drive
-                # down, because the comparison would attest to nothing —
-                # `@main` on a release branch resolves to a copy neither
-                # base nor head carries, and two equal release copies would
-                # pass a check that never looked at what re-runs.
-                #
-                # Only a delegation this step could not read at all lands
-                # outside those three, and it takes the parity rather than
-                # standing down: a runner without PyYAML would otherwise
-                # lose the re-drive entirely, and the parity is the right
-                # comparison for the local form the fleet home uses.
-                pinned=false
-                movable=false
-                while IFS= read -r delegation; do
-                  case "$delegation" in
-                    "${POLICY_WORKFLOW}@"*)
-                      # A pin is a full commit SHA, the same criterion the
-                      # guard test-pack applies to every `uses:` in a tree.
-                      # A branch or a movable tag advances without the
-                      # caller blob changing, which is the staleness this
-                      # check exists to catch rather than a reason to skip
-                      # it — and its target is not the base or head copy
-                      # either, so there is nothing here to compare.
-                      ref="${delegation#"${POLICY_WORKFLOW}@"}"
-                      if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
-                        pinned=true
-                      else
-                        movable=true
-                        movable_ref="$ref"
-                      fi
-                      break
-                      ;;
-                  esac
-                done <<<"$delegations"
-                if [[ "$movable" == "true" ]]; then
-                  echo "::notice::The caller delegates to ${POLICY_WORKFLOW} at '${movable_ref}', which is a movable ref rather than a commit: what a re-run would execute is neither the base nor the head copy, so nothing here can verify it. Leaving the approval to a fresh event, and pin the delegation to re-enable the re-drive."
+                if [[ -z "${policy_entries//[[:space:]]/}" ]]; then
+                  echo "::notice::Run ${target} records no reference to ${POLICY_WORKFLOW}, though it was matched by one; leaving the approval to a fresh event rather than re-running a policy this step cannot identify."
                   exit 0
                 fi
-                if [[ "$pinned" == "true" ]]; then
-                  echo "The caller pins ${POLICY_WORKFLOW}; the caller parity above already covers what its re-run would execute."
-                else
-                  if grep -qxF "./${policy_path}" <<<"$delegations"; then
-                    echo "The caller delegates to ${policy_path} locally; holding it to the same parity as the caller."
-                  else
-                    echo "::notice::The caller's delegation to ${POLICY_WORKFLOW} could not be read; holding the policy to the caller's parity rather than assuming a pin."
-                  fi
-                  if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_sha" --jq '.sha'); then
-                    echo "::warning::Failed to read the policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
+                base_policy_blob=""
+                while IFS=$'\t' read -r entry_ref entry_sha; do
+                  [[ -z "$entry_sha" ]] && continue
+                  # No ref means the caller named a commit. A re-run applies
+                  # the commit it named, which is the configuration the
+                  # caller asked for, and a change to that name is a change
+                  # to the caller — already covered by the parity above.
+                  [[ -z "$entry_ref" ]] && continue
+                  if [[ -z "$base_policy_blob" ]] \
+                    && ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_sha" --jq '.sha'); then
+                    echo "::warning::Failed to read ${policy_path} at the base tip; skipping the re-drive rather than re-running an unverified configuration."
                     exit 0
                   fi
-                  if ! head_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$VERIFIED_HEAD" --jq '.sha'); then
-                    echo "::warning::Failed to read the policy workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
+                  if ! entry_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$entry_sha" --jq '.sha'); then
+                    echo "::warning::Failed to read ${policy_path} at ${entry_sha}, the commit run ${target} loaded it from; skipping the re-drive rather than re-running an unverified configuration."
                     exit 0
                   fi
-                  if [[ "$base_policy_blob" != "$head_policy_blob" ]]; then
-                    echo "::notice::The policy workflow ${policy_path} changed since run ${target} (its re-run would execute the old policy); leaving the approval to a fresh event under the current contract."
+                  if [[ "$entry_blob" != "$base_policy_blob" ]]; then
+                    echo "::notice::Run ${target} loaded ${policy_path} from ${entry_sha} (via ${entry_ref}) and the base tip carries a different copy, so its re-run would execute the superseded policy; leaving the approval to a fresh event under the current contract."
                     exit 0
                   fi
-                fi
+                done <<<"$policy_entries"
               fi
               # Last live check before the POST: a synchronize landing
               # after the arm step's read would make this a stale-head

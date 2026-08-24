@@ -848,22 +848,63 @@ jobs:
                 fi
                 if [[ "$trust_conclusion" == "success" ]]; then
                   # A green job validates the approval only under the
-                  # current caller configuration — the same blob-parity
-                  # rule the rerun path applies. A caller changed on the
-                  # base since (or a dropped retarget delivery) makes
-                  # this verdict obsolete; anything unreadable or
-                  # mismatched stays suspect.
-                  # ref goes through -f so gh URL-encodes it: this read
-                  # resolves a branch name, and branch names may legally
-                  # carry '#', '&', or '+', which inline in the query
-                  # string would make this trust check read the wrong ref.
-                  if trust_base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') \
-                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base" --jq '.sha') \
+                  # current configuration, and the configuration is two
+                  # artifacts, not one: the caller, and the policy that
+                  # run loaded. Comparing the caller alone would accept a
+                  # green verdict reached under a policy the base branch
+                  # has since replaced — a callee named by commit cannot
+                  # move without the caller moving, but one reached
+                  # through a ref can — and this path does not merely
+                  # re-run on that verdict, it lets an approval stand and
+                  # a merge proceed.
+                  #
+                  # Both artifacts are read against the base tip's commit
+                  # rather than its branch name, so the whole check sees
+                  # one snapshot. The rerun path below applies the same
+                  # rule; the two cannot share an implementation, because
+                  # this workflow never checks out and each step is its
+                  # own shell.
+                  trust_ok=false
+                  if trust_base_sha=$(gh pr view "$PR_NUMBER" --json baseRefOid --jq '.baseRefOid') \
+                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base_sha" --jq '.sha') \
                     && trust_head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$VERIFIED_HEAD" --jq '.sha') \
                     && [[ "$trust_base_blob" == "$trust_head_blob" ]]; then
+                    trust_ok=true
+                    trust_policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
+                    if [[ "$trust_policy_path" != "$POLICY_WORKFLOW" ]]; then
+                      if trust_entries=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}" \
+                        --jq '.referenced_workflows[]? | select(.path | startswith(env.POLICY_WORKFLOW + "@")) | [(.ref // ""), .sha] | @tsv'); then
+                        # This run was selected by a referenced_workflows
+                        # entry naming the policy, so an empty list here is
+                        # the reading failing, not a run without a policy.
+                        if [[ -z "${trust_entries//[[:space:]]/}" ]]; then
+                          trust_ok=false
+                        fi
+                        trust_base_policy_blob=""
+                        while IFS=$'\t' read -r trust_entry_ref trust_entry_sha; do
+                          # An entry with no ref names a commit, which the
+                          # caller parity above already settles.
+                          [[ -n "$trust_entry_sha" && -n "$trust_entry_ref" ]] || continue
+                          if [[ -z "$trust_base_policy_blob" ]] \
+                            && ! trust_base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_policy_path}" -f ref="$trust_base_sha" --jq '.sha'); then
+                            trust_ok=false
+                            break
+                          fi
+                          if ! trust_entry_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_policy_path}" -f ref="$trust_entry_sha" --jq '.sha') \
+                            || [[ "$trust_entry_blob" != "$trust_base_policy_blob" ]]; then
+                            trust_ok=false
+                            break
+                          fi
+                        done <<<"$trust_entries"
+                      else
+                        trust_ok=false
+                      fi
+                    fi
+                  fi
+                  if [[ "$trust_ok" == "true" ]]; then
                     job_ok="true"
                   else
-                    echo "The green policy run's caller configuration cannot be confirmed current; treating the approval as suspect."
+                    echo "The green policy run's caller configuration, or the policy copy it loaded, cannot be confirmed current; treating the approval as suspect."
                   fi
                 fi
                 break

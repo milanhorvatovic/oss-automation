@@ -45,7 +45,13 @@ name: Dependabot Reconciler
 # approve decision is never made here (see below).
 # Optional: granting the App the Actions repository permission (read and
 # write) enables the failed-policy-run re-drive; every other path works
-# without that grant. The policy caller's trust guards must key on the
+# without that grant. That re-drive refuses to re-run a definition the
+# base branch has moved past: the caller workflow is held to blob parity
+# between the verified head and base, and a caller that delegates to this
+# repository's policy through a local `./` reference has that policy file
+# held to the same parity, since a local callee moves without the caller
+# changing. A pinned callee is exempt by design — it is frozen at its pin,
+# and a re-run applying it is applying what the caller asked for. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -139,7 +145,10 @@ on:
           entries this is matched against are repository-qualified, so a
           basename alone would also match another repository's similarly
           named workflow. Override only when the fleet home is a fork of
-          this repository.
+          this repository. When this names a workflow inside the calling
+          repository and the caller delegates to it locally, the re-drive
+          also holds that file to base parity — see the re-drive note in
+          the header.
         required: false
         type: string
         default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
@@ -1417,6 +1426,51 @@ jobs:
               if [[ "$base_blob" != "$head_blob" ]]; then
                 echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
                 exit 0
+              fi
+              # The parity above pins what a re-run executes only for as
+              # long as the caller pins its callee. A `uses: ./…`
+              # delegation names a file that moves independently of the
+              # caller, so an untouched caller can still re-run a policy
+              # that the base branch has since replaced — the same
+              # obsolete-rules re-run this check exists to refuse, arriving
+              # through the other half of the definition.
+              #
+              # Only the local form needs this. A pinned callee is frozen
+              # at its pin, and a re-run applying that pin is applying the
+              # configuration the caller asked for; holding it to the base
+              # branch's current policy would refuse a re-drive for a
+              # divergence that is deliberate. So the caller is read as it
+              # stands at the verified head, and the extra parity applies
+              # only when it delegates locally to a policy inside this
+              # repository.
+              policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
+              if [[ "$policy_path" != "$POLICY_WORKFLOW" ]]; then
+                if ! caller_source=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$VERIFIED_HEAD" -H "Accept: application/vnd.github.raw+json"); then
+                  echo "::warning::Failed to read the caller workflow's contents at the verified head; skipping the re-drive rather than re-running a configuration whose callee could not be identified."
+                  exit 0
+                fi
+                # The `uses:` targets are lifted out and compared whole,
+                # rather than matched by a pattern built from a path: the
+                # path carries dots, and a dot in a pattern is any
+                # character. Matched against the path this sweep was told
+                # to look for, not against any local delegation — a caller
+                # may call more than one workflow locally, and only the
+                # policy's parity is this check's business.
+                delegations=$(sed -nE 's@^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*@\1@p' <<<"$caller_source")
+                if grep -qxF "./${policy_path}" <<<"$delegations"; then
+                  if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_ref" --jq '.sha'); then
+                    echo "::warning::Failed to read the locally referenced policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
+                    exit 0
+                  fi
+                  if ! head_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$VERIFIED_HEAD" --jq '.sha'); then
+                    echo "::warning::Failed to read the locally referenced policy workflow at the verified head; skipping the re-drive rather than re-running an unverified configuration."
+                    exit 0
+                  fi
+                  if [[ "$base_policy_blob" != "$head_policy_blob" ]]; then
+                    echo "::notice::The locally referenced policy workflow ${policy_path} changed since run ${target} (its re-run would execute the old policy); leaving the approval to a fresh event under the current contract."
+                    exit 0
+                  fi
+                fi
               fi
               # Last live check before the POST: a synchronize landing
               # after the arm step's read would make this a stale-head

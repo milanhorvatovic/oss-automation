@@ -69,7 +69,11 @@ jobs:
             echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
-          files=$(jq -r '.files[]?.filename' <<<"$comparison")
+          # Both sides of a rename: the comparison reports the destination
+          # in filename and the source in previous_filename, so reading the
+          # destination alone would let a file renamed out of the automation
+          # tree answer for a tree it just left.
+          files=$(jq -r '.files[]? | (.filename, .previous_filename) | select(. != null and . != "")' <<<"$comparison")
           # Keyed on the whole of .github, not just workflows/: today a policy
           # run executes only what the workflow tree defines, since the callee
           # is checkout-free, but a local composite action added later would

@@ -143,11 +143,13 @@ jobs:
     # request edits .github/**, which covers every bump that could reach
     # this job's code. Such a pull request is left for a maintainer.
     # The reconciler's failed-run re-drive used to carry a residual here:
-    # it held only the caller file to base parity, which pins what re-runs
-    # for a pinned callee and says nothing about a local one, so a re-drive
-    # could execute a policy version the base branch had replaced. It now
-    # holds a locally referenced policy to that same parity, so the
-    # residual is closed rather than waiting for the pin.
+    # it held only the caller file to base parity, which settles what
+    # re-runs for a callee named by commit and says nothing about one
+    # reached through a ref, so a re-drive could execute a policy version
+    # the base branch had replaced. It now reads the run's own record of
+    # which commit it loaded the policy from and compares that copy with
+    # the base tip's, so the residual is closed for this local reference
+    # and stays closed after the pin.
     # Restore `@<sha> # vX.Y.Z` at the first release. The scope job does not
     # go with it, and an earlier revision of this branch was wrong to say it
     # would: a pinned reference is read from the merge ref exactly as a local

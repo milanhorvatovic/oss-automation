@@ -19,22 +19,66 @@ permissions:
   pull-requests: read
 
 jobs:
-  caller:
-    # Trust guards per the policy contract: keyed on the PR author, never
-    # github.actor (the reconciler's branch updates emit synchronize events
-    # whose actor is the App), plus the same-repo head pin.
+  scope:
+    # Present only for as long as the delegation below is a local reference.
+    # A local reference resolves to the caller's own commit, which on
+    # pull_request is the merge ref, so a pull request that edits the
+    # workflow tree supplies the policy that judges it and the action pins
+    # inside it. This job decides whether that is the case; the caller
+    # refuses to delegate when it is.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      touches-workflow-tree: ${{ steps.tree.outputs.touches-workflow-tree }}
+    steps:
+      - name: Check whether the pull request edits the workflow tree
+        id: tree
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPOSITORY: ${{ github.repository }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          set -euo pipefail
+          # Read from the API rather than a checkout: the payload carries a
+          # changed-file count but no paths, and checking out the merge ref
+          # to answer the question would run this repository's own tree from
+          # the pull request — the exposure the question exists to avoid.
+          files=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          touched=false
+          while IFS= read -r file; do
+            case "$file" in
+              .github/workflows/*)
+                touched=true
+                break
+                ;;
+            esac
+          done <<<"$files"
+          echo "Pull request edits the workflow tree: ${touched}."
+          echo "touches-workflow-tree=${touched}" >> "$GITHUB_OUTPUT"
+
+  caller:
+    needs: scope
+    # Trust guards per the policy contract: keyed on the PR author, never
+    # github.actor (the reconciler's branch updates emit synchronize events
+    # whose actor is the App), plus the same-repo head pin. The third
+    # conjunct is the local-reference bound described on the scope job.
+    if: >-
+      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && needs.scope.outputs.touches-workflow-tree == 'false'
     # A local reference where the contract asks consumers for a full commit
     # SHA: until the first tagged release there is no version for a pin
     # comment to name, and the guards reject one that names a branch and a
-    # date instead. The cost is real and bounded. A local reference resolves
-    # to the caller's own commit, which on pull_request is the PR's merge
-    # ref, so a Dependabot bump of create-github-app-token or fetch-metadata
-    # runs the new version inside the credentialed policy job judging that
-    # very bump. Both are privileged below, so the merge still waits for a
-    # maintainer — but only the merge waits, not the run. Restore
-    # `@<sha> # vX.Y.Z` at the first release to close that window.
+    # date instead. The privileged list below cannot make that safe on its
+    # own — the tier decision reads dependencyName and updateType out of
+    # fetch-metadata's output, so a bumped fetch-metadata classifies its own
+    # bump, and a bumped create-github-app-token receives the App private
+    # key outright; either could mint the approval rather than wait for one.
+    # What bounds it is the scope job: no delegation at all while the pull
+    # request edits .github/workflows/**, which is every bump that could
+    # reach this job's code. Such a pull request is left for a maintainer.
+    # Restore `@<sha> # vX.Y.Z` at the first release, and the scope job and
+    # this conjunct can go with it.
     uses: ./.github/workflows/dependabot-policy.yaml
     with:
       # A compromised bump of any of these touches the fleet's trust root:
@@ -42,11 +86,14 @@ jobs:
       # action mints the App token, the other parses Dependabot metadata
       # the policy trusts. Their updates are armed but held for a
       # maintainer — a malicious tag must never ride its own policy to an
-      # auto-merged pin bump. The fleet home stays listed while the
-      # reference is local and no bump can match it, so restoring the pin
-      # never has to remember to restore the entry with it.
+      # auto-merged pin bump. The fleet home is named by the two workflow
+      # paths rather than by the repository: Dependabot names a reusable
+      # workflow dependency by its repository-qualified path, and the
+      # policy matches names exactly, so a bare `milanhorvatovic/
+      # oss-automation` would never match the bump it is meant to hold.
       privileged-dependencies: |
-        milanhorvatovic/oss-automation
+        milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
+        milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml
         actions/create-github-app-token
         dependabot/fetch-metadata
     secrets:
@@ -56,19 +103,34 @@ jobs:
   gate:
     # The consumer contract's always-run gate: the trust-guarded caller job
     # skips on non-Dependabot PRs and a skipped job reports as passing, so
-    # this context — not the callee's — is the one the ruleset requires.
-    needs: caller
+    # this context — not the callee's — is the one the ruleset requires. It
+    # watches the scope job too: a scope failure skips the caller, and a
+    # skipped caller must not read as a clean policy run.
+    needs:
+      - scope
+      - caller
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail on a failed or cancelled policy run
         env:
-          RESULT: ${{ needs.caller.result }}
+          SCOPE_RESULT: ${{ needs.scope.result }}
+          CALLER_RESULT: ${{ needs.caller.result }}
+          TOUCHES_WORKFLOW_TREE: ${{ needs.scope.outputs.touches-workflow-tree }}
         run: |
           set -euo pipefail
-          if [[ "$RESULT" == "failure" || "$RESULT" == "cancelled" ]]; then
-            echo "::error::The Dependabot policy run concluded ${RESULT}."
-            exit 1
+          for stage in scope caller; do
+            case "$stage" in
+              scope) result="$SCOPE_RESULT" ;;
+              caller) result="$CALLER_RESULT" ;;
+            esac
+            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
+              echo "::error::The Dependabot ${stage} job concluded ${result}."
+              exit 1
+            fi
+          done
+          if [[ "$TOUCHES_WORKFLOW_TREE" == "true" ]]; then
+            echo "::notice::This pull request edits the workflow tree, so the policy it would be judged by is the one it carries. No delegation while the callee is referenced locally; this pull request waits for a maintainer."
           fi
-          echo "Policy result: ${RESULT}."
+          echo "Scope result: ${SCOPE_RESULT}. Policy result: ${CALLER_RESULT}."

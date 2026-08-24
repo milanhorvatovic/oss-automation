@@ -19,7 +19,7 @@ dependencies = [
 # the runtime dependencies above stay ranges because this is a library.
 [project.optional-dependencies]
 dev = [
-  "ruff==0.16.3",
+  "ruff==0.16.4",
 ]
 
 [project.entry-points.pytest11]

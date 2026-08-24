@@ -112,6 +112,23 @@ jobs:
     # github.actor (the reconciler's branch updates emit synchronize events
     # whose actor is the App), plus the same-repo head pin. The third
     # conjunct is the bound described on the scope job.
+    #
+    # What these guards bind, and what they do not. Every control in this
+    # file — both pins and the scope job's answer — is read from the merge
+    # ref, so all of it binds content Dependabot authored and nothing past
+    # that. An actor with write access can append a commit to a Dependabot
+    # branch: the pull request's author stays the bot while the head commits
+    # are theirs, and that commit can rewrite these conditions or repoint
+    # `uses:` at a workflow of their own with the secrets still mapped. A
+    # pinned callee is not protection from it — the pin is a line in the
+    # same pull-request-supplied file. The callee's authorship check refuses
+    # to approve a tampered head, which covers the case where the callee is
+    # still the real one, and covers nothing when the same commit chose
+    # which callee runs. Binding that actor takes base-anchored code: a
+    # ruleset restricting updates to dependabot/** with the bot as the only
+    # bypass, which is listed with the other activation switches, and at
+    # fleet level the question of whether these callers belong on
+    # pull_request_target instead.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && needs.scope.outputs.touches-workflow-tree == 'false'
     # A local reference where the contract asks consumers for a full commit

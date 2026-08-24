@@ -1456,7 +1456,17 @@ jobs:
                 # to look for, not against any local delegation — a caller
                 # may call more than one workflow locally, and only the
                 # policy's parity is this check's business.
-                delegations=$(sed -nE 's@^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*@\1@p' <<<"$caller_source")
+                # Quoted scalars are as valid as bare ones in YAML, and a
+                # delegation read with its quotes still attached matches
+                # nothing — which would skip this parity silently, the one
+                # failure mode a check like this must not have. Each form
+                # is lifted by its own expression, so the value arrives
+                # bare however the caller wrote it.
+                delegations=$(sed -nE \
+                  -e 's@^[[:space:]]*uses:[[:space:]]*"([^"]*)".*@\1@p' \
+                  -e "s@^[[:space:]]*uses:[[:space:]]*'([^']*)'.*@\1@p" \
+                  -e 's@^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*@\1@p' \
+                  <<<"$caller_source")
                 if grep -qxF "./${policy_path}" <<<"$delegations"; then
                   if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_ref" --jq '.sha'); then
                     echo "::warning::Failed to read the locally referenced policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."

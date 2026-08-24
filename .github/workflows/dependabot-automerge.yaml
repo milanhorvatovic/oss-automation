@@ -38,14 +38,38 @@ jobs:
         env:
           GH_TOKEN: ${{ github.token }}
           REPOSITORY: ${{ github.repository }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
+          BASE_SHA: ${{ github.event.pull_request.base.sha }}
+          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
         run: |
           set -euo pipefail
           # Read from the API rather than a checkout: the payload carries a
           # changed-file count but no paths, and checking out the merge ref
           # to answer the question would run this repository's own tree from
           # the pull request — the exposure the question exists to avoid.
-          files=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          #
+          # Compared at the event's own two commits, never at the pull
+          # request's live head. What this run executes is the merge of the
+          # head that raised the event, while a files-of-this-PR query
+          # answers for whatever head the branch carries when the query
+          # lands — and heads move here as a matter of course, since
+          # Dependabot rebases and the reconciler updates branches. A head
+          # that edits the automation tree, replaced before the query, would
+          # otherwise be judged by a later head that does not.
+          if ! comparison=$(gh api "repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"); then
+            echo "::warning::Failed to compare ${BASE_SHA}...${HEAD_SHA}; holding rather than delegating on a file list that was never read."
+            echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # The comparison carries at most 300 files, and says so by
+          # reaching the cap rather than by a flag; at the cap the list is
+          # no longer an answer, so it is not treated as one.
+          file_count=$(jq -r '.files | length' <<<"$comparison")
+          if [[ "$file_count" -ge 300 ]]; then
+            echo "::warning::The comparison lists ${file_count} files, at the API's cap; holding rather than delegating on a truncated file list."
+            echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          files=$(jq -r '.files[]?.filename' <<<"$comparison")
           # Keyed on the whole of .github, not just workflows/: today a policy
           # run executes only what the workflow tree defines, since the callee
           # is checkout-free, but a local composite action added later would
@@ -83,6 +107,17 @@ jobs:
     # What bounds it is the scope job: no delegation at all while the pull
     # request edits .github/**, which covers every bump that could reach
     # this job's code. Such a pull request is left for a maintainer.
+    # One residual rides along with the local reference. The reconciler
+    # re-drives a failed policy job only when the caller file is
+    # byte-identical between the verified head and base, which for a pinned
+    # callee pins the policy that re-runs too; here the policy is a separate
+    # file that moves on its own, so a re-drive can execute a policy version
+    # older than base's. The scope job bounds what that version can be —
+    # every delegated run's .github tree equals base's, so an older policy is
+    # one that was merged, never one a pull request supplied — which leaves
+    # config drift rather than a trust boundary. Teaching the reconciler to
+    # compare a local callee would close it; the pin at first release closes
+    # it either way.
     # Restore `@<sha> # vX.Y.Z` at the first release, and the scope job and
     # this conjunct can go with it.
     uses: ./.github/workflows/dependabot-policy.yaml

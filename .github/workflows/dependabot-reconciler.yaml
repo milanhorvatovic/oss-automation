@@ -53,12 +53,17 @@ name: Dependabot Reconciler
 # calling repository, its file is held to the same parity unless the
 # caller is proved to pin it. A pin is exempt by design: frozen at its
 # pin, a re-run applies the configuration the caller asked for. A
-# delegation that cannot be read as a pin takes the parity rather than
-# skipping it, and a pin means a full commit SHA — a branch or a movable
-# tag advances without the caller blob changing, which is the staleness
-# this refuses rather than an exemption from it. The delegations are read
-# from the parsed caller, so `uses:` text inside a run: block cannot grant
-# the exemption, and a caller that does not parse proves no pin. The policy caller's trust guards must key on the
+# delegation decides which of three answers applies. A pin — a full commit
+# SHA, the criterion the guard test-pack applies to every `uses:` in a
+# tree — is exempt, since a re-run applies the configuration the caller
+# asked for. A local reference takes the parity, because the file this
+# repository holds is the file that re-runs. Any other remote ref stands
+# the re-drive down: a branch or a movable tag resolves to a copy that is
+# neither base's nor head's, so comparing those two would attest to
+# nothing. Delegations are read from the parsed caller, so `uses:` text
+# inside a run: block cannot grant an exemption, and a caller that cannot
+# be read takes the parity rather than losing the re-drive to a missing
+# parser. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -153,9 +158,10 @@ on:
           basename alone would also match another repository's similarly
           named workflow. Override only when the fleet home is a fork of
           this repository. When this names a workflow inside the calling
-          repository, the re-drive also holds that file to base parity
-          unless the caller is proved to pin it — see the re-drive note in
-          the header.
+          repository, the re-drive holds that file to base parity when the
+          caller delegates to it locally, exempts it when the caller pins
+          it at a commit, and stands down when the caller names a movable
+          ref — see the re-drive note in the header.
         required: false
         type: string
         default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
@@ -1484,20 +1490,25 @@ jobs:
                   echo "::notice::The caller workflow's delegations could not be read from its structure; holding the policy to the caller's parity rather than assuming a pin."
                 fi
                 rm -f "$caller_file"
-                # Classified by what can be proved rather than by what is
-                # absent, because these expressions are line matches and a
-                # caller is YAML: `uses :` carries a legal space before the
-                # colon, a folded scalar puts the value on the next line,
-                # and neither is lifted here. Skipping the parity on a
-                # delegation that could not be read would be this check
-                # failing open on exactly the callers whose formatting it
-                # did not anticipate. So a pin — the one form the parity
-                # must not apply to, since a pinned policy is frozen at its
-                # pin and re-running it applies what the caller asked for —
-                # is what has to be proved, and everything else takes the
-                # check. A hold costs one sweep and the next event re-drives;
-                # a skip re-runs a policy the base branch has replaced.
+                # Three answers, and the delegation decides which. A pin
+                # exempts: frozen at a commit, its re-run applies the
+                # configuration the caller asked for, and the caller parity
+                # above already covers the pin itself. A local reference
+                # takes the parity: the file this repository holds is the
+                # file that re-runs, so base and head copies are the right
+                # two things to compare. Anything else stands the re-drive
+                # down, because the comparison would attest to nothing —
+                # `@main` on a release branch resolves to a copy neither
+                # base nor head carries, and two equal release copies would
+                # pass a check that never looked at what re-runs.
+                #
+                # Only a delegation this step could not read at all lands
+                # outside those three, and it takes the parity rather than
+                # standing down: a runner without PyYAML would otherwise
+                # lose the re-drive entirely, and the parity is the right
+                # comparison for the local form the fleet home uses.
                 pinned=false
+                movable=false
                 while IFS= read -r delegation; do
                   case "$delegation" in
                     "${POLICY_WORKFLOW}@"*)
@@ -1506,22 +1517,30 @@ jobs:
                       # A branch or a movable tag advances without the
                       # caller blob changing, which is the staleness this
                       # check exists to catch rather than a reason to skip
-                      # it.
+                      # it — and its target is not the base or head copy
+                      # either, so there is nothing here to compare.
                       ref="${delegation#"${POLICY_WORKFLOW}@"}"
                       if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
                         pinned=true
-                        break
+                      else
+                        movable=true
+                        movable_ref="$ref"
                       fi
+                      break
                       ;;
                   esac
                 done <<<"$delegations"
+                if [[ "$movable" == "true" ]]; then
+                  echo "::notice::The caller delegates to ${POLICY_WORKFLOW} at '${movable_ref}', which is a movable ref rather than a commit: what a re-run would execute is neither the base nor the head copy, so nothing here can verify it. Leaving the approval to a fresh event, and pin the delegation to re-enable the re-drive."
+                  exit 0
+                fi
                 if [[ "$pinned" == "true" ]]; then
                   echo "The caller pins ${POLICY_WORKFLOW}; the caller parity above already covers what its re-run would execute."
                 else
                   if grep -qxF "./${policy_path}" <<<"$delegations"; then
                     echo "The caller delegates to ${policy_path} locally; holding it to the same parity as the caller."
                   else
-                    echo "::notice::The caller's delegation to ${POLICY_WORKFLOW} could not be classified as pinned; holding the policy to the caller's parity rather than assuming a pin."
+                    echo "::notice::The caller's delegation to ${POLICY_WORKFLOW} could not be read; holding the policy to the caller's parity rather than assuming a pin."
                   fi
                   if ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_sha" --jq '.sha'); then
                     echo "::warning::Failed to read the policy workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."

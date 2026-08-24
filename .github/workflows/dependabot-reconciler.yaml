@@ -54,7 +54,11 @@ name: Dependabot Reconciler
 # caller is proved to pin it. A pin is exempt by design: frozen at its
 # pin, a re-run applies the configuration the caller asked for. A
 # delegation that cannot be read as a pin takes the parity rather than
-# skipping it, since the reader is a line match and a caller is YAML. The policy caller's trust guards must key on the
+# skipping it, and a pin means a full commit SHA — a branch or a movable
+# tag advances without the caller blob changing, which is the staleness
+# this refuses rather than an exemption from it. The delegations are read
+# from the parsed caller, so `uses:` text inside a run: block cannot grant
+# the exemption, and a caller that does not parse proves no pin. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -1462,24 +1466,24 @@ jobs:
                   echo "::warning::Failed to read the caller workflow's contents at the verified head; skipping the re-drive rather than re-running a configuration whose callee could not be identified."
                   exit 0
                 fi
-                # The `uses:` targets are lifted out and compared whole,
-                # rather than matched by a pattern built from a path: the
-                # path carries dots, and a dot in a pattern is any
-                # character. Matched against the path this sweep was told
-                # to look for, not against any local delegation — a caller
-                # may call more than one workflow locally, and only the
-                # policy's parity is this check's business.
-                # Quoted scalars are as valid as bare ones in YAML, and a
-                # delegation read with its quotes still attached matches
-                # nothing — which would skip this parity silently, the one
-                # failure mode a check like this must not have. Each form
-                # is lifted by its own expression, so the value arrives
-                # bare however the caller wrote it.
-                delegations=$(sed -nE \
-                  -e 's@^[[:space:]]*uses:[[:space:]]*"([^"]*)".*@\1@p' \
-                  -e "s@^[[:space:]]*uses:[[:space:]]*'([^']*)'.*@\1@p" \
-                  -e 's@^[[:space:]]*uses:[[:space:]]*([^[:space:]#]+).*@\1@p' \
-                  <<<"$caller_source")
+                # Read from the parsed document, not from the text. A
+                # line match cannot tell a `uses:` key from the same
+                # characters inside a run: block, and it misses the forms
+                # YAML allows a key to take — a space before the colon, a
+                # folded scalar, quotes. Both directions matter here: text
+                # in a scalar must not grant the pin exemption, and a
+                # delegation written unusually must not be invisible.
+                # When nothing can be parsed — a runner without PyYAML, a
+                # caller that does not load — the list stays empty, which
+                # proves no pin, which applies the parity. Unreadable and
+                # unproven are the same answer to this step.
+                caller_file=$(mktemp)
+                printf '%s' "$caller_source" >"$caller_file"
+                if ! delegations=$(python3 -c "import sys, yaml; document = yaml.safe_load(open(sys.argv[1], encoding='utf-8')) or {}; jobs = document.get('jobs') or {}; print('\n'.join(job['uses'].strip() for job in jobs.values() if isinstance(job, dict) and isinstance(job.get('uses'), str)))" "$caller_file" 2>/dev/null); then
+                  delegations=""
+                  echo "::notice::The caller workflow's delegations could not be read from its structure; holding the policy to the caller's parity rather than assuming a pin."
+                fi
+                rm -f "$caller_file"
                 # Classified by what can be proved rather than by what is
                 # absent, because these expressions are line matches and a
                 # caller is YAML: `uses :` carries a legal space before the
@@ -1497,8 +1501,17 @@ jobs:
                 while IFS= read -r delegation; do
                   case "$delegation" in
                     "${POLICY_WORKFLOW}@"*)
-                      pinned=true
-                      break
+                      # A pin is a full commit SHA, the same criterion the
+                      # guard test-pack applies to every `uses:` in a tree.
+                      # A branch or a movable tag advances without the
+                      # caller blob changing, which is the staleness this
+                      # check exists to catch rather than a reason to skip
+                      # it.
+                      ref="${delegation#"${POLICY_WORKFLOW}@"}"
+                      if [[ "$ref" =~ ^[0-9a-f]{40}$ ]]; then
+                        pinned=true
+                        break
+                      fi
                       ;;
                   esac
                 done <<<"$delegations"

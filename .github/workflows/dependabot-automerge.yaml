@@ -35,6 +35,10 @@ jobs:
     timeout-minutes: 5
     outputs:
       touches-workflow-tree: ${{ steps.tree.outputs.touches-workflow-tree }}
+      # Why the hold happened, so a maintainer reading the gate can tell a
+      # pull request that edits the tree from a comparison that could not be
+      # read. Both hold; only one is a statement about the pull request.
+      hold-reason: ${{ steps.tree.outputs.hold-reason }}
     steps:
       - name: Check whether the pull request edits the workflow tree
         id: tree
@@ -61,6 +65,7 @@ jobs:
           if ! comparison=$(gh api "repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"); then
             echo "::warning::Failed to compare ${BASE_SHA}...${HEAD_SHA}; holding rather than delegating on a file list that was never read."
             echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
+            echo "hold-reason=comparison-unreadable" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # The comparison carries at most 300 files, and says so by
@@ -70,6 +75,7 @@ jobs:
           if [[ "$file_count" -ge 300 ]]; then
             echo "::warning::The comparison lists ${file_count} files, at the API's cap; holding rather than delegating on a truncated file list."
             echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
+            echo "hold-reason=comparison-truncated" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # Both sides of a rename: the comparison reports the destination
@@ -94,6 +100,11 @@ jobs:
           done <<<"$files"
           echo "Pull request edits the automation tree: ${touched}."
           echo "touches-workflow-tree=${touched}" >> "$GITHUB_OUTPUT"
+          if [[ "$touched" == "true" ]]; then
+            echo "hold-reason=edits-automation-tree" >> "$GITHUB_OUTPUT"
+          else
+            echo "hold-reason=" >> "$GITHUB_OUTPUT"
+          fi
 
   caller:
     needs: scope
@@ -170,7 +181,7 @@ jobs:
         env:
           SCOPE_RESULT: ${{ needs.scope.result }}
           CALLER_RESULT: ${{ needs.caller.result }}
-          TOUCHES_WORKFLOW_TREE: ${{ needs.scope.outputs.touches-workflow-tree }}
+          HOLD_REASON: ${{ needs.scope.outputs.hold-reason }}
         run: |
           set -euo pipefail
           for stage in scope caller; do
@@ -183,7 +194,20 @@ jobs:
               exit 1
             fi
           done
-          if [[ "$TOUCHES_WORKFLOW_TREE" == "true" ]]; then
-            echo "::notice::This pull request edits the workflow tree, so the policy it would be judged by is the one it carries. No delegation while the callee is referenced locally; this pull request waits for a maintainer."
-          fi
+          # Each hold reads differently to whoever is looking at this
+          # context. Only the first is a statement about the pull request;
+          # the other two are the check declining to guess, and saying so
+          # here is what keeps them diagnosable rather than indistinguishable
+          # from a finding.
+          case "$HOLD_REASON" in
+            edits-automation-tree)
+              echo "::notice::This pull request edits .github/**, so it would supply the code that judges it. No delegation; it waits for a maintainer."
+              ;;
+            comparison-unreadable)
+              echo "::notice::The scope check could not read this pull request's comparison and held it rather than assuming an answer. No delegation; it waits for a maintainer. This says nothing about the pull request's contents."
+              ;;
+            comparison-truncated)
+              echo "::notice::This pull request's comparison reached the API's 300-file cap, so the scope check held it rather than reading a list that had stopped being an answer. No delegation; it waits for a maintainer."
+              ;;
+          esac
           echo "Scope result: ${SCOPE_RESULT}. Policy result: ${CALLER_RESULT}."

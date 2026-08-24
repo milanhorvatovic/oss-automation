@@ -46,16 +46,22 @@ jobs:
           # to answer the question would run this repository's own tree from
           # the pull request — the exposure the question exists to avoid.
           files=$(gh api "repos/${REPOSITORY}/pulls/${PR_NUMBER}/files" --paginate --jq '.[].filename')
+          # Keyed on the whole of .github, not just workflows/: today a policy
+          # run executes only what the workflow tree defines, since the callee
+          # is checkout-free, but a local composite action added later would
+          # live beside it and escape the narrower prefix. Dependabot only
+          # ever edits .github/workflows here, so the wider prefix holds
+          # nothing extra in practice.
           touched=false
           while IFS= read -r file; do
             case "$file" in
-              .github/workflows/*)
+              .github/*)
                 touched=true
                 break
                 ;;
             esac
           done <<<"$files"
-          echo "Pull request edits the workflow tree: ${touched}."
+          echo "Pull request edits the automation tree: ${touched}."
           echo "touches-workflow-tree=${touched}" >> "$GITHUB_OUTPUT"
 
   caller:
@@ -75,8 +81,8 @@ jobs:
     # bump, and a bumped create-github-app-token receives the App private
     # key outright; either could mint the approval rather than wait for one.
     # What bounds it is the scope job: no delegation at all while the pull
-    # request edits .github/workflows/**, which is every bump that could
-    # reach this job's code. Such a pull request is left for a maintainer.
+    # request edits .github/**, which covers every bump that could reach
+    # this job's code. Such a pull request is left for a maintainer.
     # Restore `@<sha> # vX.Y.Z` at the first release, and the scope job and
     # this conjunct can go with it.
     uses: ./.github/workflows/dependabot-policy.yaml

@@ -294,13 +294,32 @@ jobs:
           GH_TOKEN: ${{ steps.bot-token.outputs.token || secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          if ! pr_json=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus); then
+          if ! pr_json=$(gh pr view "$PR_NUMBER" --json state,isDraft,labels,autoMergeRequest,mergeStateStatus,baseRefName); then
             echo "::error::Failed to read the live state of PR #${PR_NUMBER}; refusing to reconcile it blind."
             exit 1
           fi
           pr_state=$(jq -r '.state' <<<"$pr_json")
           if [[ "$pr_state" != "OPEN" ]]; then
             echo "PR #${PR_NUMBER} is ${pr_state} (raced the sweep); nothing to reconcile."
+            echo "open=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          # A pull_request_target run takes its workflow, its GITHUB_REF and
+          # its GITHUB_SHA from the default branch whatever the pull request
+          # targets, so a policy run for a non-default base was produced by a
+          # tree that base does not carry. Every parity check further down
+          # compares against the base — the trust archaeology, the re-drive —
+          # and against the wrong base they answer a question nobody asked.
+          # The policy contract has callers refuse such a pull request
+          # outright; a sweep that meets one anyway leaves it alone rather
+          # than reconciling it against a configuration it never ran under.
+          if ! default_branch=$(gh api "repos/${GH_REPO}" --jq '.default_branch'); then
+            echo "::error::Failed to read ${GH_REPO}'s default branch; refusing to reconcile PR #${PR_NUMBER} blind."
+            exit 1
+          fi
+          pr_base=$(jq -r '.baseRefName' <<<"$pr_json")
+          if [[ "$pr_base" != "$default_branch" ]]; then
+            echo "::notice::PR #${PR_NUMBER} targets ${pr_base} rather than the default branch ${default_branch}. A pull_request_target policy run executes the default branch's tree, which this base does not carry, so the sweep leaves this pull request for manual review."
             echo "open=false" >> "$GITHUB_OUTPUT"
             exit 0
           fi

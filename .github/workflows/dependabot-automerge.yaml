@@ -9,10 +9,19 @@ name: Dependabot Automerge
 # workflow, and on pull_request the file naming that workflow is read from
 # the merge ref — so the pull request would choose the code the credentials
 # reach, whether by editing a locally referenced callee or by moving the SHA
-# a pinned one names. pull_request_target reads this file from the base
+# a pinned one names. pull_request_target reads this file from the default
 # branch, so the delegation, the guards below and the privileged list are
 # the ones a maintainer merged, and a bump is judged by code it did not
 # supply.
+#
+# The default branch, specifically, and not the branch the pull request
+# targets: since 8 December 2025 GitHub resolves a pull_request_target
+# workflow's source, GITHUB_REF and GITHUB_SHA from the default branch
+# whatever the base is, so that a stale workflow on some other branch
+# cannot be selected by choosing it as a base. A pull request targeting
+# anything else would therefore be judged by a caller and a privileged
+# list its own base does not carry, which is why the guard below refuses
+# to delegate for one at all.
 #
 # The usual objection to pull_request_target is that it pairs credentials
 # with a checkout of pull-request code, which is how it earns its
@@ -49,14 +58,24 @@ jobs:
     # github.actor (the reconciler's branch updates emit synchronize events
     # whose actor is the App), plus the same-repo head pin. They carry more
     # weight on this trigger than they did on pull_request: every pull
-    # request now reaches a workflow holding credentials, and these two
+    # request now reaches a workflow holding credentials, and these
     # conjuncts are what keep the delegation to Dependabot's own same-repo
     # branches.
+    #
+    # The third conjunct holds the delegation to pull requests targeting
+    # the default branch, because that is the only base for which what
+    # runs and what the pull request is measured against are the same
+    # tree. A Dependabot `target-branch` pull request would be judged by
+    # the default branch's caller, list and policy while its own base
+    # carries others, and every downstream parity check — the sweep's
+    # trust archaeology, its re-drive — compares against that base. Left
+    # for a maintainer rather than decided by a configuration nobody
+    # reading the pull request would think to look at.
     if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
+      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch
     # Local rather than pinned, and on this trigger that is a preference
-    # rather than a risk: the reference resolves against the base branch,
-    # so it names the policy this repository merged. Pinning at a release
+    # rather than a risk: the reference resolves against the default
+    # branch, so it names the policy this repository merged. Pinning at a release
     # remains open as dogfooding — the fleet home consuming itself the way
     # its consumers do — and the reconciler's re-drive verifies either form.
     uses: ./.github/workflows/dependabot-policy.yaml
@@ -67,7 +86,7 @@ jobs:
       # the policy trusts. Their updates are armed but held for a
       # maintainer — a malicious tag must never ride its own policy to an
       # auto-merged pin bump. That hold is real on this trigger: the policy
-      # weighing the list is the base branch's, not the one the bump
+      # weighing the list is the default branch's, not the one the bump
       # carries. The fleet home is named by the two workflow paths rather
       # than by the repository, because Dependabot names a reusable
       # workflow dependency by its repository-qualified path and the policy

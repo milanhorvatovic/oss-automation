@@ -12,11 +12,22 @@ name: Dependabot Policy
 # the credentials reach, by editing a local callee or by moving the SHA a
 # pinned one names, and the privileged list below would be weighed by the
 # very code a bump introduced. On pull_request_target the caller is read
-# from the base branch, so the delegation, the guards and the list are the
-# ones a maintainer merged. The trigger's usual hazard is that it pairs
-# credentials with a checkout of pull-request code; nothing here checks
-# out (see below), which is what makes it correct here rather than merely
-# convenient. The `edited` type is
+# from the default branch, so the delegation, the guards and the list are
+# the ones a maintainer merged. The trigger's usual hazard is that it
+# pairs credentials with a checkout of pull-request code; nothing here
+# checks out (see below), which is what makes it correct here rather than
+# merely convenient.
+#
+# The default branch is where a pull_request_target workflow, its
+# GITHUB_REF and its GITHUB_SHA come from as of 8 December 2025 —
+# whatever branch the pull request targets. A caller must therefore hold
+# its delegation to pull requests targeting the default branch, with
+# base.ref == the repository's default_branch as a third `if:` conjunct.
+# Anything else would be judged by a caller, a privileged list and a
+# policy its own base does not carry, and the reconciler's parity checks
+# read that base. Consumers using Dependabot's `target-branch` keep those
+# pull requests on manual review rather than under a configuration their
+# base never showed them. The `edited` type is
 # load-bearing, not cosmetic: a base retarget emits only `edited`, and
 # without it no policy run ever re-evaluates the PR under the new
 # base's caller configuration. The authorship guard must key on the PR author

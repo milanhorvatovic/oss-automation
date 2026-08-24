@@ -26,7 +26,19 @@ from .model import WorkflowFile
 
 _FULL_COMMIT_SHA = re.compile(r"[0-9a-f]{40}")
 _DOCKER_DIGEST = re.compile(r"@sha256:[0-9a-f]{64}\Z")
-_VERSION_SHAPED = re.compile(r"\d")
+# The whole comment must be the version — matching a substring let
+# `# main 2026-08-17` pass on the date's digits alone. A prerelease or build
+# suffix is admitted only after a dotted core, so a bare date cannot parse as
+# one without banning the hyphens semver allows inside identifiers.
+# Deliberately looser than semver: docker tags (`3.20-alpine`) and bare majors
+# (`v7`) are versions a pin legitimately names.
+_IDENTIFIER = r"[0-9A-Za-z-]+"
+_VERSION_COMMENT = re.compile(
+    rf"v?\d+(?:\.\d+)+"
+    rf"(?:-{_IDENTIFIER}(?:\.{_IDENTIFIER})*)?"
+    rf"(?:\+{_IDENTIFIER}(?:\.{_IDENTIFIER})*)?"
+    rf"|v?\d+"
+)
 # Only consulted when an expression does not parse, to decide whether the
 # unknown could have been a credential.
 _SECRETS_MENTION = re.compile(r"\bsecrets\b", re.IGNORECASE)
@@ -83,7 +95,7 @@ def unpinned_uses(workflow: WorkflowFile) -> list[str]:
         comment = _trailing_comment(lines[lineno - 1]) if lineno <= len(lines) else None
         if comment is None:
             findings.append(f"line {lineno} pins '{value}' without a trailing version comment")
-        elif not _VERSION_SHAPED.search(comment):
+        elif not _VERSION_COMMENT.fullmatch(comment):
             findings.append(
                 f"line {lineno} annotates '{value}' with '# {comment}', which does not"
                 " name the pinned version"

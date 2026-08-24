@@ -303,6 +303,47 @@ class TestUsesPinning:
         assert len(findings) == 1
         assert "does not name the pinned version" in findings[0]
 
+    def test_branch_and_date_comment_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              call:
+                uses: owner/repo/.github/workflows/callee.yaml@{SHA} # main 2026-08-17
+            """
+        )
+        findings = checks.unpinned_uses(parsed)
+        assert len(findings) == 1
+        assert "does not name the pinned version" in findings[0]
+
+    @pytest.mark.parametrize(
+        "comment",
+        ["v7", "3.20", "3.20-alpine", "v1.2.3-rc.1", "v1.2.3-alpha-beta", "v1.2.3-rc.1+build.5"],
+    )
+    def test_version_shaped_comments_pass(self, comment: str) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA} # {comment}
+            """
+        )
+        assert checks.unpinned_uses(parsed) == []
+
+    @pytest.mark.parametrize("comment", ["2026-08-17", "v1.2.3-...", "v1.2.3-", "v1.2.3-rc..1"])
+    def test_non_version_comments_are_found(self, comment: str) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA} # {comment}
+            """
+        )
+        findings = checks.unpinned_uses(parsed)
+        assert len(findings) == 1
+        assert "does not name the pinned version" in findings[0]
+
 
 class TestPermissions:
     def test_workflow_level_block_passes(self) -> None:

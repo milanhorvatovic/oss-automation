@@ -45,7 +45,23 @@ name: Dependabot Reconciler
 # approve decision is never made here (see below).
 # Optional: granting the App the Actions repository permission (read and
 # write) enables the failed-policy-run re-drive; every other path works
-# without that grant. The policy caller's trust guards must key on the
+# without that grant. That re-drive refuses to re-run a definition the
+# base branch has moved past. The caller workflow is held to blob parity
+# between the verified head and the base tip — read at that tip's SHA, not
+# through the branch name, and re-checked against the live tip before the
+# rerun POST — which settles the caller and, with it, any callee the
+# caller pins by commit. What a pin cannot settle is a callee that moves
+# on its own, so when the policy this sweep looks for lives in the calling
+# repository, the run's own record of what it loaded decides: each callee
+# carries the commit it came from and the ref that chose it, a commit the
+# caller named carrying no ref at all. A callee loaded through a ref — a
+# local `./` reference resolving to the pull request's merge commit, a
+# branch, a tag — is compared against the base tip's copy of that file,
+# and a difference stands the re-drive down. Reading the run rather than
+# the caller is deliberate: a re-run replays this run's definition, so its
+# entries are what would execute, and nothing has to be inferred from
+# delegation syntax, from `uses:` text inside a run: block, or from which
+# job happens to come first. The policy caller's trust guards must key on the
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
@@ -139,7 +155,10 @@ on:
           entries this is matched against are repository-qualified, so a
           basename alone would also match another repository's similarly
           named workflow. Override only when the fleet home is a fork of
-          this repository.
+          this repository. When this names a workflow inside the calling
+          repository, the re-drive compares the copy the run actually
+          loaded against the base tip's, exempting only a callee the
+          caller named by commit — see the re-drive note in the header.
         required: false
         type: string
         default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
@@ -829,18 +848,63 @@ jobs:
                 fi
                 if [[ "$trust_conclusion" == "success" ]]; then
                   # A green job validates the approval only under the
-                  # current caller configuration — the same blob-parity
-                  # rule the rerun path applies. A caller changed on the
-                  # base since (or a dropped retarget delivery) makes
-                  # this verdict obsolete; anything unreadable or
-                  # mismatched stays suspect.
-                  if trust_base=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName') \
-                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base" --jq '.sha') \
+                  # current configuration, and the configuration is two
+                  # artifacts, not one: the caller, and the policy that
+                  # run loaded. Comparing the caller alone would accept a
+                  # green verdict reached under a policy the base branch
+                  # has since replaced — a callee named by commit cannot
+                  # move without the caller moving, but one reached
+                  # through a ref can — and this path does not merely
+                  # re-run on that verdict, it lets an approval stand and
+                  # a merge proceed.
+                  #
+                  # Both artifacts are read against the base tip's commit
+                  # rather than its branch name, so the whole check sees
+                  # one snapshot. The rerun path below applies the same
+                  # rule; the two cannot share an implementation, because
+                  # this workflow never checks out and each step is its
+                  # own shell.
+                  trust_ok=false
+                  if trust_base_sha=$(gh pr view "$PR_NUMBER" --json baseRefOid --jq '.baseRefOid') \
+                    && trust_base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$trust_base_sha" --jq '.sha') \
                     && trust_head_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_path}" -f ref="$VERIFIED_HEAD" --jq '.sha') \
                     && [[ "$trust_base_blob" == "$trust_head_blob" ]]; then
+                    trust_ok=true
+                    trust_policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
+                    if [[ "$trust_policy_path" != "$POLICY_WORKFLOW" ]]; then
+                      if trust_entries=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${trust_run}" \
+                        --jq '.referenced_workflows[]? | select(.path | startswith(env.POLICY_WORKFLOW + "@")) | [(.ref // ""), .sha] | @tsv'); then
+                        # This run was selected by a referenced_workflows
+                        # entry naming the policy, so an empty list here is
+                        # the reading failing, not a run without a policy.
+                        if [[ -z "${trust_entries//[[:space:]]/}" ]]; then
+                          trust_ok=false
+                        fi
+                        trust_base_policy_blob=""
+                        while IFS=$'\t' read -r trust_entry_ref trust_entry_sha; do
+                          # An entry with no ref names a commit, which the
+                          # caller parity above already settles.
+                          [[ -n "$trust_entry_sha" && -n "$trust_entry_ref" ]] || continue
+                          if [[ -z "$trust_base_policy_blob" ]] \
+                            && ! trust_base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_policy_path}" -f ref="$trust_base_sha" --jq '.sha'); then
+                            trust_ok=false
+                            break
+                          fi
+                          if ! trust_entry_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${trust_policy_path}" -f ref="$trust_entry_sha" --jq '.sha') \
+                            || [[ "$trust_entry_blob" != "$trust_base_policy_blob" ]]; then
+                            trust_ok=false
+                            break
+                          fi
+                        done <<<"$trust_entries"
+                      else
+                        trust_ok=false
+                      fi
+                    fi
+                  fi
+                  if [[ "$trust_ok" == "true" ]]; then
                     job_ok="true"
                   else
-                    echo "The green policy run's caller configuration cannot be confirmed current; treating the approval as suspect."
+                    echo "The green policy run's caller configuration, or the policy copy it loaded, cannot be confirmed current; treating the approval as suspect."
                   fi
                 fi
                 break
@@ -865,6 +929,23 @@ jobs:
             echo "A veto label arrived during the trust check; enforcing the hold."
             enforce_disarm "a veto label arrived during the trust check"
             exit 0
+          fi
+          # The base snapshot the trust check validated against predates
+          # this mutation for the same reason the veto snapshot did, and
+          # goes stale the same way: a merge landing meanwhile can replace
+          # the policy that green verdict was reached under, and nothing
+          # read so far would show it. Only the trust path sets this, so
+          # only a certification resting on that path is held to it. A
+          # stand-down here costs one sweep; the next re-reads everything.
+          if [[ -n "${trust_base_sha:-}" ]]; then
+            if ! live_base_sha=$(gh pr view "$PR_NUMBER" --json baseRefOid --jq '.baseRefOid'); then
+              echo "::error::Failed to re-read PR #${PR_NUMBER}'s base tip after the trust check; refusing to mutate blind."
+              exit 1
+            fi
+            if [[ "$live_base_sha" != "$trust_base_sha" ]]; then
+              echo "The base branch advanced (${trust_base_sha} -> ${live_base_sha}) after the trust check read it, so the policy that verdict was reached under may already be superseded; leaving the approval to the next sweep."
+              exit 0
+            fi
           fi
           # Deliberately after the trust check: an already-armed squash
           # PR must not be certified verified-armed — which feeds the
@@ -1398,15 +1479,21 @@ jobs:
               # definition in that window was authored on the protected
               # base branch, so the residual is maintainer config drift,
               # not a trust-boundary breach.
-              if ! base_ref=$(gh pr view "$PR_NUMBER" --json baseRefName --jq '.baseRefName'); then
+              if ! base_state=$(gh pr view "$PR_NUMBER" --json baseRefName,baseRefOid); then
                 echo "::warning::Failed to read the PR's base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
-              # ref goes through -f so gh URL-encodes it: branch names
-              # may legally carry '#', '&', or '+', which inline in the
-              # query string would make this trust check read the wrong
-              # ref.
-              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_ref" --jq '.sha'); then
+              base_ref=$(jq -r '.baseRefName' <<<"$base_state")
+              # The parity reads below take the base tip's SHA, not the
+              # branch name that points at it. A branch name resolves to
+              # whatever it holds at the moment of the read, so a merge
+              # landing between these reads and the rerun POST would leave
+              # parity attesting to a definition the base branch no longer
+              # has — the same obsolete-rules re-run this check refuses,
+              # arriving through the clock rather than through the files.
+              # The live check before the POST holds this SHA to account.
+              base_sha=$(jq -r '.baseRefOid' <<<"$base_state")
+              if ! base_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${target_path}" -f ref="$base_sha" --jq '.sha'); then
                 echo "::warning::Failed to read the caller workflow at the base branch; skipping the re-drive rather than re-running an unverified configuration."
                 exit 0
               fi
@@ -1418,6 +1505,59 @@ jobs:
                 echo "::notice::The caller workflow ${target_path} changed since run ${target} (its re-run would execute the old definition and inputs); leaving the approval to a fresh event under the current contract."
                 exit 0
               fi
+              # The parity above settles the caller, and with it any
+              # callee the caller named by commit: such a name cannot move
+              # without the caller file moving. It settles nothing about a
+              # callee that resolves through a ref — a local `./`
+              # delegation, a branch, a tag — because that target moves on
+              # its own, so an untouched caller can still re-run a policy
+              # the base branch has since replaced. That is the same
+              # obsolete-rules re-run this check refuses, arriving through
+              # the other half of the definition.
+              policy_path="${POLICY_WORKFLOW#"${GH_REPO}/"}"
+              if [[ "$policy_path" != "$POLICY_WORKFLOW" ]]; then
+                # The run is asked what it loaded, rather than the caller
+                # being read and the answer inferred from it. Each run
+                # records, per callee, the commit it came from and the ref
+                # that chose it: a commit pin carries no ref at all, a
+                # branch or tag carries its refs/heads or refs/tags name,
+                # and a local `./` reference carries the pull request's
+                # merge ref. A re-run replays this run's definition, so
+                # these entries are exactly what would execute — no
+                # delegation syntax to parse, no `uses:` in a run: block to
+                # mistake for one, and no job order to pick a winner from.
+                if ! policy_entries=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs/${target}" \
+                  --jq '.referenced_workflows[]? | select(.path | startswith(env.POLICY_WORKFLOW + "@")) | [(.ref // ""), .sha] | @tsv'); then
+                  echo "::warning::Failed to read run ${target}'s referenced workflows; skipping the re-drive rather than re-running a configuration whose policy could not be identified."
+                  exit 0
+                fi
+                if [[ -z "${policy_entries//[[:space:]]/}" ]]; then
+                  echo "::notice::Run ${target} records no reference to ${POLICY_WORKFLOW}, though it was matched by one; leaving the approval to a fresh event rather than re-running a policy this step cannot identify."
+                  exit 0
+                fi
+                base_policy_blob=""
+                while IFS=$'\t' read -r entry_ref entry_sha; do
+                  [[ -z "$entry_sha" ]] && continue
+                  # No ref means the caller named a commit. A re-run applies
+                  # the commit it named, which is the configuration the
+                  # caller asked for, and a change to that name is a change
+                  # to the caller — already covered by the parity above.
+                  [[ -z "$entry_ref" ]] && continue
+                  if [[ -z "$base_policy_blob" ]] \
+                    && ! base_policy_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$base_sha" --jq '.sha'); then
+                    echo "::warning::Failed to read ${policy_path} at the base tip; skipping the re-drive rather than re-running an unverified configuration."
+                    exit 0
+                  fi
+                  if ! entry_blob=$(gh api -X GET "repos/${GH_REPO}/contents/${policy_path}" -f ref="$entry_sha" --jq '.sha'); then
+                    echo "::warning::Failed to read ${policy_path} at ${entry_sha}, the commit run ${target} loaded it from; skipping the re-drive rather than re-running an unverified configuration."
+                    exit 0
+                  fi
+                  if [[ "$entry_blob" != "$base_policy_blob" ]]; then
+                    echo "::notice::Run ${target} loaded ${policy_path} from ${entry_sha} (via ${entry_ref}) and the base tip carries a different copy, so its re-run would execute the superseded policy; leaving the approval to a fresh event under the current contract."
+                    exit 0
+                  fi
+                done <<<"$policy_entries"
+              fi
               # Last live check before the POST: a synchronize landing
               # after the arm step's read would make this a stale-head
               # re-run that displaces the pending current-head policy
@@ -1425,14 +1565,19 @@ jobs:
               # retarget's fresh `edited` policy run can itself be
               # displaced from that slot, so the parity just verified
               # could still belong to the old base.
-              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName); then
+              if ! live_pr=$(gh pr view "$PR_NUMBER" --json headRefOid,baseRefName,baseRefOid); then
                 echo "::warning::Failed to re-read the PR before the re-run; leaving the re-drive to the next sweep."
                 exit 0
               fi
               live_head=$(jq -r '.headRefOid' <<<"$live_pr")
               live_base=$(jq -r '.baseRefName' <<<"$live_pr")
+              live_base_sha=$(jq -r '.baseRefOid' <<<"$live_pr")
               if [[ "$live_head" != "$VERIFIED_HEAD" ]]; then
                 echo "The head moved past the verified commit set (${VERIFIED_HEAD} -> ${live_head}); that event's policy run owns the new head."
+                exit 0
+              fi
+              if [[ "$live_base_sha" != "$base_sha" ]]; then
+                echo "The base branch advanced (${base_sha} -> ${live_base_sha}) after the parity checks read it; the definition they attested to may no longer be the base's, so the re-drive waits for the next sweep."
                 exit 0
               fi
               if [[ "$live_base" != "$base_ref" ]]; then

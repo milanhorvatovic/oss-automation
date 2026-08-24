@@ -142,24 +142,21 @@ jobs:
     # What bounds it is the scope job: no delegation at all while the pull
     # request edits .github/**, which covers every bump that could reach
     # this job's code. Such a pull request is left for a maintainer.
-    # One residual rides along with the local reference. The reconciler
-    # re-drives a failed policy job only when the caller file is
-    # byte-identical between the verified head and base, which for a pinned
-    # callee pins the policy that re-runs too; here the policy is a separate
-    # file that moves on its own, so a re-drive can execute a policy version
-    # older than base's. The scope job bounds what that version can be —
-    # every delegated run's .github tree equals base's, so an older policy is
-    # one that was merged, never one a pull request supplied — which leaves
-    # config drift rather than a trust boundary. Teaching the reconciler to
-    # compare a local callee would close it; the pin at first release closes
-    # it either way.
+    # The reconciler's failed-run re-drive used to carry a residual here:
+    # it held only the caller file to base parity, which settles what
+    # re-runs for a callee named by commit and says nothing about one
+    # reached through a ref, so a re-drive could execute a policy version
+    # the base branch had replaced. It now reads the run's own record of
+    # which commit it loaded the policy from and compares that copy with
+    # the base tip's, so the residual is closed for this local reference
+    # and stays closed after the pin.
     # Restore `@<sha> # vX.Y.Z` at the first release. The scope job does not
     # go with it, and an earlier revision of this branch was wrong to say it
     # would: a pinned reference is read from the merge ref exactly as a local
     # one is, so a pull request bumping that pin selects the policy that
     # judges the bump, and the privileged list is once again the bumped
-    # code's to honour. What the release ends is the local reference and the
-    # reconciler residual above — not the need for this conjunct.
+    # code's to honour. What the release ends is the local reference — not
+    # the need for this conjunct.
     uses: ./.github/workflows/dependabot-policy.yaml
     with:
       # A compromised bump of any of these touches the fleet's trust root:

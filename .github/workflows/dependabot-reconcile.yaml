@@ -26,7 +26,12 @@ jobs:
       contents: read
       pull-requests: read
       actions: read
-    uses: milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml@6096e7f31a220c4c7e2a5d9ccfde742858350a18 # main 2026-08-17
+    # Local, for the reason the policy caller states — and here at none of
+    # its cost: schedule resolves this against the default branch and
+    # workflow_dispatch against a ref only write access can pick, so no pull
+    # request's tree ever supplies the callee. Same footing as release.yaml's
+    # local self-call.
+    uses: ./.github/workflows/dependabot-reconciler.yaml
     secrets:
       automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

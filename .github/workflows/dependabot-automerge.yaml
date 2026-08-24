@@ -25,14 +25,26 @@ jobs:
     # whose actor is the App), plus the same-repo head pin.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
-    uses: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml@6096e7f31a220c4c7e2a5d9ccfde742858350a18 # main 2026-08-17
+    # A local reference where the contract asks consumers for a full commit
+    # SHA: until the first tagged release there is no version for a pin
+    # comment to name, and the guards reject one that names a branch and a
+    # date instead. The cost is real and bounded. A local reference resolves
+    # to the caller's own commit, which on pull_request is the PR's merge
+    # ref, so a Dependabot bump of create-github-app-token or fetch-metadata
+    # runs the new version inside the credentialed policy job judging that
+    # very bump. Both are privileged below, so the merge still waits for a
+    # maintainer — but only the merge waits, not the run. Restore
+    # `@<sha> # vX.Y.Z` at the first release to close that window.
+    uses: ./.github/workflows/dependabot-policy.yaml
     with:
       # A compromised bump of any of these touches the fleet's trust root:
       # the fleet home hosts the policy these callers delegate to, one
       # action mints the App token, the other parses Dependabot metadata
       # the policy trusts. Their updates are armed but held for a
       # maintainer — a malicious tag must never ride its own policy to an
-      # auto-merged pin bump.
+      # auto-merged pin bump. The fleet home stays listed while the
+      # reference is local and no bump can match it, so restoring the pin
+      # never has to remember to restore the entry with it.
       privileged-dependencies: |
         milanhorvatovic/oss-automation
         actions/create-github-app-token

@@ -65,7 +65,10 @@ name: Dependabot Reconciler
 # PR author (github.event.pull_request.user.login), never on
 # github.actor — the branch updates this sweep performs emit synchronize
 # events whose actor is the App, and an actor-keyed guard would skip
-# policy on exactly the events this sweep exists to produce.
+# policy on exactly the events this sweep exists to produce. Those
+# guards sit on a pull_request_target caller: the policy runs this sweep
+# looks up are matched by that event, so a caller left on pull_request is
+# invisible to the lookups below and its PRs are left for manual triage.
 #
 # Per open Dependabot PR (same-repo head), the sweep reconciles live
 # state to the policy workflow's own invariants:
@@ -833,8 +836,14 @@ jobs:
               # veto-era skipped job is no verdict, and stopping on it
               # while the re-drive honors the older green run would
               # leave the PR unarmed on every sweep.
+              # The event filter names pull_request_target because that is
+              # the trigger the policy contract requires of a caller: a
+              # credentialed delegation has to be read from the base
+              # branch, not from the merge ref. A caller still on
+              # pull_request produces runs this filter does not see, and
+              # the sweep stands down rather than mis-attributing them.
               # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
-              trust_rows=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
+              trust_rows=$(GH_TOKEN="$ACTIONS_READ_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request_target&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate --slurp \
                 --jq '(env.PR_NUMBER | tonumber) as $n | .[].workflow_runs[] | select((.pull_requests | length) == 1 and any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path] | @tsv') || trust_rows=""
               job_ok="false"
               while IFS=$'\t' read -r trust_run trust_path; do
@@ -1383,8 +1392,12 @@ jobs:
           # run associated with more than one PR cannot be attributed to
           # a triggering PR at all — the walk below stands down on those
           # rather than re-running another PR's event context.
+          # pull_request_target for the reason given at the trust
+          # lookup above: it is the trigger the policy contract requires,
+          # and a caller still on pull_request emits runs this filter does
+          # not match.
           # shellcheck disable=SC2016  # $n is a jq variable; the single quotes are deliberate
-          if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
+          if ! run_rows=$(GH_TOKEN="$RERUN_TOKEN" gh api "repos/${GH_REPO}/actions/runs?event=pull_request_target&head_sha=${VERIFIED_HEAD}&per_page=100" --paginate \
             --jq '(env.PR_NUMBER | tonumber) as $n | .workflow_runs[] | select(any(.pull_requests[]?; .number == $n)) | select(any(.referenced_workflows[]?; .path | startswith(env.POLICY_WORKFLOW + "@"))) | [(.id | tostring), .path, (.pull_requests | length | tostring)] | @tsv'); then
             echo "::warning::Failed to list workflow runs for the verified head; leaving the re-drive to the next sweep."
             exit 0

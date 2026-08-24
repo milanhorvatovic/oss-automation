@@ -20,12 +20,15 @@ permissions:
 
 jobs:
   scope:
-    # Present only for as long as the delegation below is a local reference.
-    # A local reference resolves to the caller's own commit, which on
-    # pull_request is the merge ref, so a pull request that edits the
-    # workflow tree supplies the policy that judges it and the action pins
-    # inside it. This job decides whether that is the case; the caller
-    # refuses to delegate when it is.
+    # On pull_request this caller is itself read from the merge ref, so the
+    # pull request chooses which code gets handed the App secrets. A local
+    # reference lets it supply the callee's content; a pinned reference lets
+    # it supply the callee's identity, by moving the SHA the `uses:` line
+    # names. Both arrive at one place — a bump judged by the code that bump
+    # introduces, for which the privileged-dependencies list is something to
+    # honour or ignore as it chooses. This job answers whether the pull
+    # request edits the automation tree, and the caller refuses to delegate
+    # when it does. It outlives the local reference below.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
     runs-on: ubuntu-latest
@@ -97,7 +100,7 @@ jobs:
     # Trust guards per the policy contract: keyed on the PR author, never
     # github.actor (the reconciler's branch updates emit synchronize events
     # whose actor is the App), plus the same-repo head pin. The third
-    # conjunct is the local-reference bound described on the scope job.
+    # conjunct is the bound described on the scope job.
     if: >-
       github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && needs.scope.outputs.touches-workflow-tree == 'false'
     # A local reference where the contract asks consumers for a full commit
@@ -122,8 +125,13 @@ jobs:
     # config drift rather than a trust boundary. Teaching the reconciler to
     # compare a local callee would close it; the pin at first release closes
     # it either way.
-    # Restore `@<sha> # vX.Y.Z` at the first release, and the scope job and
-    # this conjunct can go with it.
+    # Restore `@<sha> # vX.Y.Z` at the first release. The scope job does not
+    # go with it, and an earlier revision of this branch was wrong to say it
+    # would: a pinned reference is read from the merge ref exactly as a local
+    # one is, so a pull request bumping that pin selects the policy that
+    # judges the bump, and the privileged list is once again the bumped
+    # code's to honour. What the release ends is the local reference and the
+    # reconciler residual above — not the need for this conjunct.
     uses: ./.github/workflows/dependabot-policy.yaml
     with:
       # A compromised bump of any of these touches the fleet's trust root:

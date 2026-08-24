@@ -1,0 +1,266 @@
+name: Release Tag
+
+# Reusable tag-driven release: the caller runs on its own v* tag push, gates
+# with its own verification jobs first (the project owns its tests — this
+# workflow never runs them), and delegates here with contents: write. Both
+# jobs below check out the caller's tagged commit and run in the caller's own
+# repository context; the optional parity checks and the caller-supplied
+# version command are confined to the read-only one, so only publishing ever
+# shares a runner with a token that can write. The curated half of the notes is the changelog's '## [X.Y.Z]'
+# section; GitHub's generated notes are appended by the release API. A tag
+# whose version carries a prerelease suffix — SemVer's -rc.1 or PEP 440's rc1
+# and .dev1 alike — is published as a prerelease, so it never displaces the
+# current release as "Latest".
+#
+# Re-driving a failed publish is deliberate manual work: creating a release is
+# not idempotent, so a re-run after the release exists fails with 422
+# already_exists. Delete the release and re-run — the tag is already pushed,
+# and a create-or-update shape here would mask a genuinely duplicated release.
+
+on:
+  workflow_call:
+    inputs:
+      changelog-path:
+        description: >-
+          Path of the Keep a Changelog file whose '## [X.Y.Z]' section becomes
+          the curated notes. An empty string disables the changelog parity
+          check and the curated half.
+        required: false
+        type: string
+        default: CHANGELOG.md
+      version-command:
+        description: >-
+          Shell command printing the manifest version to compare against the
+          tag (e.g. reading pyproject.toml or package.json). It runs in this
+          workflow's read-only job, which checks out the tagged commit but sets
+          up no language toolchain, so it may rely only on what the runner
+          image provides. The comparison is an exact string match against the tag
+          minus a leading v, so an ecosystem that normalises versions away
+          from the tag's spelling — PEP 440's 0.1.0rc1 against SemVer's
+          0.1.0-rc.1 — must either keep the manifest spelled like the tag or
+          pass an empty string to skip the check.
+        required: false
+        type: string
+        default: ""
+      append-generated-notes:
+        description: Append GitHub's generated notes below the curated half.
+        required: false
+        type: boolean
+        default: true
+      prerelease:
+        description: >-
+          Whether the release is a prerelease, and so cannot become "Latest":
+          'auto' classifies the tag (SemVer's hyphen after a dotted release
+          segment, or a PEP 440 pre/dev identifier in any segment position,
+          matched case-insensitively), while 'true' and 'false' state it
+          outright. Say it outright where the schemes disagree — X.Y.Z-N is a
+          prerelease to SemVer and a post release to PEP 440, and 'auto' reads
+          it as the prerelease.
+        required: false
+        type: string
+        default: auto
+    outputs:
+      tag-name:
+        description: The tag the release was cut from, for a follow-on publish job.
+        value: ${{ jobs.release.outputs.tag-name }}
+      html-url:
+        description: Web URL of the published release.
+        value: ${{ jobs.release.outputs.html-url }}
+
+permissions:
+  contents: read
+
+jobs:
+  # Split from the publishing job because the version command is arbitrary
+  # caller shell, and a step running arbitrary shell owns every later step in
+  # its own job: $GITHUB_ENV and $GITHUB_PATH are per-job files the runner
+  # replays into what follows, and the writable directories already on PATH
+  # are shared just the same — a planted `gh` would be handed the publishing
+  # token by the step that runs next. A separate job is a separate runner, so
+  # the token that can write releases never shares a machine with code the
+  # caller supplied. Validation earning nothing but a read-only token is also
+  # what makes "fail before any mutation" structural rather than a promise
+  # about step order.
+  verify:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # The ref decides what gets released; anything but a tag means the
+      # caller wired the trigger wrong, and releasing a branch head under a
+      # guessed name must fail before any mutation.
+      - name: Refuse a non-tag caller event
+        if: ${{ !startsWith(github.ref, 'refs/tags/') }}
+        env:
+          REF: ${{ github.ref }}
+        run: |
+          set -euo pipefail
+          echo "::error::This reusable workflow releases the pushed tag; call it from a tag push event (got ${REF})."
+          exit 1
+
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # The caller's version command runs arbitrary shell in this job and
+          # nothing here touches git, so the checkout's default persisted
+          # credential would be readable by that command for no gain.
+          persist-credentials: false
+
+      - name: Verify the tag matches the manifest version
+        if: inputs.version-command != ''
+        env:
+          TAG: ${{ github.ref_name }}
+          VERSION_COMMAND: ${{ inputs.version-command }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          manifest=$(bash -c "$VERSION_COMMAND")
+          if [[ "$version" != "$manifest" ]]; then
+            echo "::error::Tag ${TAG} does not match the manifest version ${manifest}; bump the manifest before tagging."
+            exit 1
+          fi
+
+      - name: Verify the changelog carries this version's section
+        if: inputs.changelog-path != ''
+        env:
+          TAG: ${{ github.ref_name }}
+          CHANGELOG_PATH: ${{ inputs.changelog-path }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # Matched literally, with the same index()-at-column-1 test the
+          # extractor uses. A regex would let the version's dots match any
+          # character, so '## [1-2-3]' would satisfy this check for tag v1.2.3
+          # and then extract nothing — the check passing on a heading the
+          # curated notes can never be read from.
+          if ! awk -v heading="## [${version}]" '
+            index($0, heading) == 1 {found = 1; exit}
+            END {exit !found}
+          ' "$CHANGELOG_PATH"; then
+            echo "::error::${CHANGELOG_PATH} has no '## [${version}]' section; move the Unreleased content under it before tagging."
+            exit 1
+          fi
+
+  release:
+    needs: verify
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    # A caller gates a follow-on job on this job's success; these carry what
+    # such a job needs to name what was released.
+    outputs:
+      tag-name: ${{ steps.publish.outputs.tag-name }}
+      html-url: ${{ steps.publish.outputs.html-url }}
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Only the changelog is read here, and the publish step authenticates
+          # through GH_TOKEN rather than git.
+          persist-credentials: false
+
+      - name: Publish the GitHub release
+        id: publish
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ github.ref_name }}
+          CHANGELOG_PATH: ${{ inputs.changelog-path }}
+          APPEND_GENERATED: ${{ inputs.append-generated-notes }}
+          PRERELEASE: ${{ inputs.prerelease }}
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          # GitHub promotes the newest non-prerelease to "Latest", so a release
+          # cut from a prerelease tag has to say so — otherwise v1.0.0-rc.1
+          # displaces v0.9.0 as what the repository page and the
+          # releases/latest endpoint hand to consumers.
+          #
+          # 'auto' reads the tag rather than the scheme, because the two
+          # schemes a tag may be written in disagree. PEP 440 orders segments
+          # release[pre][post][dev][+local] and SemVer puts everything after
+          # the first hyphen, so a marker can sit well right of the release
+          # segment (1.0.0.post1.dev1 is a development build, not a release).
+          # Splitting the release segment off and searching what remains
+          # covers every ordering instead of the one position a fixed suffix
+          # pattern can see. Case is ignored: PEP 440 identifiers are
+          # case-insensitive, so 1.0.0RC1 is 1.0.0rc1.
+          #
+          # What it cannot settle, and why the input exists: X.Y.Z-N is a
+          # numeric prerelease identifier to SemVer and a post release to PEP
+          # 440, read here as the prerelease. A project using that spelling
+          # says 'false' outright rather than relying on the guess.
+          #
+          # The patterns live in variables because that is the form the bash
+          # manual recommends for regexes carrying backslashes: how quote
+          # removal treats them inside [[ =~ ]] has varied across bash
+          # versions, and a '\.' silently degraded to "any character" would
+          # reclassify the CalVer tags the dotted-core rule exists to spare.
+          #
+          # release_pattern: optional PEP 440 epoch, the numeric release
+          # segment, then whatever follows it. marker_pattern: a prerelease or
+          # development identifier standing as its own segment, so the 'b' in
+          # a local part like .deb1 is not one.
+          release_pattern='^([0-9]+!)?[0-9]+((\.[0-9]+)*)(.*)$'
+          marker_pattern='(^|[-_.])(a|b|c|rc|alpha|beta|pre|preview|dev)[0-9]*($|[-_.])'
+          case "$PRERELEASE" in
+            true | false)
+              prerelease="$PRERELEASE"
+              ;;
+            auto)
+              prerelease=false
+              # The local segment is metadata on either scheme and never
+              # decides this, so it goes before anything is matched.
+              core="${version%%+*}"
+              dotted=""
+              suffix=""
+              if [[ "$core" =~ $release_pattern ]]; then
+                dotted="${BASH_REMATCH[2]}"
+                suffix="${BASH_REMATCH[4]}"
+              fi
+              shopt -s nocasematch
+              if [[ -n "$dotted" && "$suffix" == -* ]]; then
+                # SemVer, and only after a dotted release segment — the same
+                # rule the pin-comment guard applies, so a hyphenated CalVer
+                # tag like v2026-08-24 stays a release rather than becoming a
+                # prerelease of 2026 that leaves "Latest" stuck forever.
+                prerelease=true
+              elif [[ "$suffix" =~ $marker_pattern ]]; then
+                prerelease=true
+              fi
+              shopt -u nocasematch
+              ;;
+            *)
+              echo "::error::prerelease must be auto, true or false (got ${PRERELEASE})."
+              exit 1
+              ;;
+          esac
+          notes=""
+          if [[ -n "$CHANGELOG_PATH" ]]; then
+            # The oldest version is the file's last section, so the link
+            # reference definitions Keep a Changelog collects at the bottom
+            # terminate it as surely as the next heading does.
+            notes=$(awk -v heading="## [${version}]" '
+              index($0, heading) == 1 && !found {found = 1; next}
+              /^## \[/ && found {exit}
+              /^\[[^]]+\]:[[:space:]]/ && found {exit}
+              found {print}
+            ' "$CHANGELOG_PATH")
+          fi
+          url=$(gh api "repos/${GH_REPO}/releases" \
+            -f tag_name="$TAG" \
+            -f name="$TAG" \
+            -f body="$notes" \
+            -F generate_release_notes="$APPEND_GENERATED" \
+            -F prerelease="$prerelease" \
+            --jq '.html_url')
+          # The response no longer reaches the log now that stdout is
+          # captured, and a successful release that names nothing is the wrong
+          # log to land on when re-driving a 422.
+          echo "Published ${TAG} (prerelease=${prerelease}): ${url}"
+          {
+            printf 'tag-name=%s\n' "$TAG"
+            printf 'html-url=%s\n' "$url"
+          } >> "$GITHUB_OUTPUT"

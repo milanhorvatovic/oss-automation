@@ -10,6 +10,12 @@ Reusable GitHub Actions workflows and structural guard tests powering automation
 
 Consumers call the workflows at a full 40-character commit SHA and let Dependabot bump the pin. The test-pack installs the same way — `pip install "oss-automation-guards @ git+https://github.com/milanhorvatovic/oss-automation@<sha>"` — and runs from the consumer repository's root as `pytest --pyargs oss_automation_guards` (point it elsewhere with `--workflow-tree`; declare a deliberate trust-model exemption per workflow file with the `guards_trust_exempt` pytest ini option).
 
+## Releasing
+
+Release automation ships in two reusable flavors, so integrators pick the one matching their commit convention: **`release-tag`** (tag-driven — the caller verifies with its own jobs, then the workflow checks tag/manifest/changelog parity and publishes the GitHub Release with the changelog section as curated notes and GitHub's generated notes appended) and **`release-please`** (Conventional-Commits driven — a bot-maintained release PR accumulates the bump and changelog; requires the caller's commits or squash titles to follow Conventional Commits).
+
+This repository itself releases from `main` with the tag-driven flavor: bump `[project] version` in `pyproject.toml`, move the `Unreleased` changelog content under a dated `## [X.Y.Z]` section, merge, then push the `vX.Y.Z` tag.
+
 ## Status
 
 Under construction — the first tagged release will mark the workflows as consumable. Until then, nothing here is stable.

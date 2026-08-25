@@ -90,6 +90,16 @@ jobs:
             echo "::error::CHANGELOG.md already carries a '## [${VERSION}]' section; that release is prepared, and only its tag is missing."
             exit 1
           fi
+          # A closed-and-redispatched attempt leaves its head branch on the
+          # remote, and the next run's branch is built on a newer base, so the
+          # push would be refused as non-fast-forward. Refusing here says which
+          # branch to delete instead of failing three steps later on a message
+          # about fast-forwards; deleting it from the run would discard a
+          # branch that might still hold an open pull request.
+          if git ls-remote --exit-code --heads origin "release/v${VERSION}" >/dev/null 2>&1; then
+            echo "::error::branch release/v${VERSION} already exists on the remote; delete it (git push origin --delete release/v${VERSION}) or close and delete its pull request before dispatching again."
+            exit 1
+          fi
 
       - name: Generate the changelog section and bump the manifest
         env:
@@ -138,7 +148,7 @@ jobs:
           cat > "${RUNNER_TEMP}/release-pr-body.md" <<EOF
           Prepared by \`release-prepare.yaml\`. The changelog section is GitHub's generated release notes for this range; anything written under Unreleased was carried across above it.
 
-          The section covers the default branch at \`${BASE_SHA}\`. Anything merged after that lands in the tag but in no notes, so if the default branch has moved on when you come back to this, close this pull request and dispatch again rather than merging it stale.
+          The section covers the default branch at \`${BASE_SHA}\`. Anything merged after that lands in the tag but in no notes, so if the default branch has moved on when you come back to this, close this pull request, delete its \`release/v${VERSION}\` branch, and dispatch again rather than merging it stale.
 
           Review the section, then merge and tag that merge commit — not whatever the default branch has advanced to:
 

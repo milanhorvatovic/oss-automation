@@ -36,8 +36,8 @@ jobs:
         run: python -m pip install '.[dev]'
       - name: Lint
         run: |
-          ruff check src tests
-          ruff format --check src tests
+          ruff check src tests .github/scripts
+          ruff format --check src tests .github/scripts
       - name: Run the unit tests
         run: pytest
       - name: Run the guards against this repository's workflow tree
@@ -55,3 +55,8 @@ jobs:
       version-command: >-
         python3 -c 'import tomllib;
         print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])'
+      # release-prepare.yaml already writes GitHub's generated list into the
+      # changelog section this publishes, so appending it again would print
+      # the same pull requests twice — and the second pass would also list the
+      # release-preparation pull request, which merged after the first.
+      append-generated-notes: false

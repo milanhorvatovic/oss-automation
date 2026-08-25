@@ -48,6 +48,17 @@ def test_generated_list_lands_under_the_new_version():
     assert result.index("* Add a guard by @someone", heading) > heading
 
 
+def test_category_headings_survive_demoted():
+    notes = (
+        "## What's Changed\n"
+        "## Dependencies\n"
+        "* Bump ruff by @dependabot in https://github.com/owner/repo/pull/2\n"
+    )
+    result = rewrite(notes=notes)
+    assert "#### Dependencies" in result
+    assert "## Dependencies" not in result.replace("#### Dependencies", "")
+
+
 def test_release_page_furniture_is_dropped():
     result = rewrite()
     assert "New Contributors" not in result

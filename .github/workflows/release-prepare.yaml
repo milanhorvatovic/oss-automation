@@ -67,8 +67,8 @@ jobs:
           # Guarding the input rather than the tag: release-tag compares the
           # manifest against the tag minus its leading v as an exact string, so
           # a 'v' typed here would travel into pyproject.toml and fail there.
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([0-9A-Za-z]+)?([-.][0-9A-Za-z]+)*$ ]]; then
-            echo "::error::version '${VERSION}' is not a release version; pass it without a leading v (e.g. 0.1.1)."
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]; then
+            echo "::error::version '${VERSION}' is not a PEP 440 release version hatchling will accept in [project].version; pass it without a leading v (e.g. 0.1.1, 0.2.0rc1)."
             exit 1
           fi
           # The pattern above still admits spellings git refuses, and the
@@ -163,7 +163,8 @@ jobs:
 
           \`\`\`
           git switch ${DEFAULT_BRANCH} && git pull
-          git tag v${VERSION} <merge-commit-of-this-pull-request>
+          MERGE_SHA=...   # the merge commit of this pull request
+          git tag v${VERSION} "\$MERGE_SHA"
           git push origin v${VERSION}
           \`\`\`
 

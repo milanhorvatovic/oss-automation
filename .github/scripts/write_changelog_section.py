@@ -52,8 +52,16 @@ def clean_notes(body: str) -> str:
         if line.startswith("## New Contributors"):
             break
         if line.startswith("## "):
-            # The generator's own '## What's Changed' heading; this file nests
-            # the list under a section heading of its own instead.
+            heading = line[3:].strip()
+            if heading == "What's Changed":
+                # The generator's own heading; this file nests the list under a
+                # section heading of its own instead.
+                continue
+            # A category heading, which appears once .github/release.yml groups
+            # the list by label. Dropping it with the default heading would
+            # flatten every category into one list; demoting keeps it nested
+            # under this file's '### Merged pull requests'.
+            kept.append(f"#### {heading}")
             continue
         if line.startswith("**Full Changelog**"):
             continue

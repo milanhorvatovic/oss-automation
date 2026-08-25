@@ -51,6 +51,10 @@ jobs:
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           token: ${{ steps.bot-token.outputs.token }}
+          # workflow_dispatch runs against whichever ref was picked in the UI,
+          # and an omitted `ref` follows it. A release is cut from the default
+          # branch or not at all, so name it rather than inherit the choice.
+          ref: ${{ github.event.repository.default_branch }}
           # The generator needs the tag history to bound the previous release.
           fetch-depth: 0
 
@@ -70,18 +74,27 @@ jobs:
             echo "::error::tag v${VERSION} already exists; releasing it again would need the tag deleted first."
             exit 1
           fi
+          # The tag is pushed by hand after the release pull request merges, so
+          # between those two steps the check above passes for a version the
+          # changelog already carries. Rewriting then appends a second section
+          # and a second link for it.
+          if grep -qF "## [${VERSION}]" CHANGELOG.md; then
+            echo "::error::CHANGELOG.md already carries a '## [${VERSION}]' section; that release is prepared, and only its tag is missing."
+            exit 1
+          fi
 
       - name: Generate the changelog section and bump the manifest
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           # An empty previous tag is the first release, where the generator
           # covers the whole history — which is what a first changelog wants.
           previous=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
-          args=(-f tag_name="v${VERSION}" -f target_commitish="${GITHUB_REF_NAME}")
+          args=(-f tag_name="v${VERSION}" -f target_commitish="${DEFAULT_BRANCH}")
           if [[ -n "$previous" ]]; then
             args+=(-f previous_tag_name="$previous")
           fi
@@ -98,6 +111,7 @@ jobs:
           GH_REPO: ${{ github.repository }}
           VERSION: ${{ inputs.version }}
           APP_SLUG: ${{ steps.bot-token.outputs.app-slug }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
           branch="release/v${VERSION}"
@@ -124,7 +138,7 @@ jobs:
           \`release-tag.yaml\` verifies that the tag, the manifest version and this section agree before it publishes.
           EOF
           gh pr create \
-            --base "${GITHUB_REF_NAME}" \
+            --base "${DEFAULT_BRANCH}" \
             --head "$branch" \
             --title "Release v${VERSION}" \
             --body-file "${RUNNER_TEMP}/release-pr-body.md"

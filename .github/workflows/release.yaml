@@ -55,3 +55,8 @@ jobs:
       version-command: >-
         python3 -c 'import tomllib;
         print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])'
+      # release-prepare.yaml already writes GitHub's generated list into the
+      # changelog section this publishes, so appending it again would print
+      # the same pull requests twice — and the second pass would also list the
+      # release-preparation pull request, which merged after the first.
+      append-generated-notes: false

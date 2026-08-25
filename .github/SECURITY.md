@@ -24,7 +24,9 @@ The interesting failures are in the trust model rather than in memory safety. Re
 - **A guard that passes a tree it should fail** — a false negative in `oss-automation-guards` is a security bug, not a test bug: consumers run it as a gate and read a green result as an assurance about their own workflow tree.
 - **Revocation that does not revoke** — a disarm or approval dismissal that reports success while auto-merge stays armed.
 
-Out of scope: behaviour that requires a consumer to have disabled a documented requirement (the kill-switch variable, the required `gate` context, stale-review dismissal), and findings in GitHub Actions itself rather than in this repository's use of it. Report those to GitHub.
+Out of scope: behaviour that requires a consumer to have removed part of the contract these workflows document — the required `gate` context, or stale-review dismissal on the default branch — and findings in GitHub Actions itself rather than in this repository's use of it. Report those to GitHub.
+
+The kill switch is deliberately not on that list. Turning `DEPENDABOT_AUTOMERGE_ENABLED` off is a supported state rather than a removed safeguard: the policy revokes its own approvals and disarms App-armed auto-merge when it reads false. Automation that stays armed after the switch goes off is the revocation failure named above, and a report about it is in scope.
 
 ## Reporting a weakness in your own repository
 

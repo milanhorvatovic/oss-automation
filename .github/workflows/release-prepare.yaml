@@ -1,6 +1,7 @@
 name: Prepare Release
 
-# Cuts the release commit so nobody hand-edits three files that have to agree.
+# Cuts the release commit so nobody hand-edits the two files that have to
+# agree with the tag.
 # release-tag.yaml refuses to publish unless the tag, the manifest version and
 # a '## [X.Y.Z]' changelog section all match, and getting one of the three
 # wrong is discovered at publish time, after the tag is already pushed.
@@ -97,7 +98,7 @@ jobs:
           # about fast-forwards; deleting it from the run would discard a
           # branch that might still hold an open pull request.
           if git ls-remote --exit-code --heads origin "release/v${VERSION}" >/dev/null 2>&1; then
-            echo "::error::branch release/v${VERSION} already exists on the remote; delete it (git push origin --delete release/v${VERSION}) or close and delete its pull request before dispatching again."
+            echo "::error::branch release/v${VERSION} already exists on the remote; delete it (git push origin --delete release/v${VERSION}) or close its pull request and delete the branch, before dispatching again."
             exit 1
           fi
 

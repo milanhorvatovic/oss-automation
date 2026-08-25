@@ -44,10 +44,15 @@ on:
         required: false
         type: string
         default: ""
-    secrets:
       automation-client-id:
-        description: Optional client ID of a GitHub App; with the private key, release PRs trigger CI.
+        description: >-
+          Optional client ID of a GitHub App; with the private key,
+          release PRs trigger CI. An identifier rather than a credential,
+          so it travels as a repository variable the caller passes in.
         required: false
+        type: string
+        default: ""
+    secrets:
       automation-private-key:
         description: Private key of the same GitHub App.
         required: false
@@ -89,7 +94,7 @@ jobs:
       # Step `if:` conditions cannot read the secrets context; surface the
       # presence of each half of the App credential here (booleans, never the
       # values).
-      AUTOMATION_ID_PRESENT: ${{ secrets.automation-client-id != '' }}
+      AUTOMATION_ID_PRESENT: ${{ inputs.automation-client-id != '' }}
       AUTOMATION_KEY_PRESENT: ${{ secrets.automation-private-key != '' }}
     steps:
       # Half a pair is a configuration error, not a choice to use the
@@ -108,7 +113,7 @@ jobs:
         if: env.AUTOMATION_ID_PRESENT == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.automation-client-id }}
+          client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
           # Downscope from the App's full installation grant to what
           # release-please calls: tags and releases live under contents, and

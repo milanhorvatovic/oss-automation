@@ -32,6 +32,7 @@ jobs:
     # request's tree ever supplies the callee. Same footing as release.yaml's
     # local self-call.
     uses: ./.github/workflows/dependabot-reconciler.yaml
+    with:
+      automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
     secrets:
-      automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

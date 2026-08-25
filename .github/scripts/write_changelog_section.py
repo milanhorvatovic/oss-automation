@@ -51,16 +51,18 @@ def clean_notes(body: str) -> str:
     for line in body.splitlines():
         if line.startswith("## New Contributors"):
             break
-        if line.startswith("## "):
-            heading = line[3:].strip()
+        if line.startswith("## ") or line.startswith("### "):
+            heading = line.lstrip("#").strip()
             if heading == "What's Changed":
                 # The generator's own heading; this file nests the list under a
                 # section heading of its own instead.
                 continue
             # A category heading, which appears once .github/release.yml groups
-            # the list by label. Dropping it with the default heading would
-            # flatten every category into one list; demoting keeps it nested
-            # under this file's '### Merged pull requests'.
+            # the list by label. GitHub renders those as '###' beneath its own
+            # '## What's Changed', so both levels have to be caught: dropping
+            # them would flatten every category into one list, and leaving them
+            # at '###' would make them siblings of this file's own '### Merged
+            # pull requests' rather than its contents.
             kept.append(f"#### {heading}")
             continue
         if line.startswith("**Full Changelog**"):

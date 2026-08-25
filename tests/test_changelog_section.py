@@ -49,14 +49,16 @@ def test_generated_list_lands_under_the_new_version():
 
 
 def test_category_headings_survive_demoted():
+    # GitHub renders release.yml categories as '###' under its own
+    # "## What's Changed", which is the shape this fixture has to model.
     notes = (
         "## What's Changed\n"
-        "## Dependencies\n"
+        "### Dependencies\n"
         "* Bump ruff by @dependabot in https://github.com/owner/repo/pull/2\n"
     )
     result = rewrite(notes=notes)
     assert "#### Dependencies" in result
-    assert "## Dependencies" not in result.replace("#### Dependencies", "")
+    assert "### Dependencies" not in result.replace("#### Dependencies", "")
 
 
 def test_release_page_furniture_is_dropped():

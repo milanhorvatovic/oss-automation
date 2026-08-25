@@ -37,7 +37,7 @@ pytest --pyargs oss_automation_guards
 
 Any workflow file you add or edit must satisfy the structural rules, or CI fails:
 
-- Every job declares a `timeout-minutes`.
+- Every runner job declares a `timeout-minutes`. Jobs that only call a reusable workflow (`uses:`) are exempt — Actions rejects the key there, and the callee's own jobs carry it instead.
 - Every third-party action is pinned to a full 40-character commit SHA with a trailing comment naming the pinned version (`# v7.0.1`). A comment that merely contains a digit does not satisfy this.
 - Default-token write scopes are declared explicitly rather than inherited.
 - A PR-triggered workflow that holds credentials is bound to its declared trust model.

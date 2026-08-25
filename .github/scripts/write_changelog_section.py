@@ -103,10 +103,13 @@ def rewrite_changelog(text: str, version: str, date: str, notes: str, repo: str)
 
 
 def bump_manifest(text: str, version: str) -> str:
-    replacement, count = _VERSION_LINE.subn(f'version = "{version}"', text, count=1)
-    if count != 1:
-        raise SystemExit(f"{MANIFEST}: found {count} version lines to bump, expected exactly 1")
-    return replacement
+    # Count before substituting: subn with count=1 can never report more than
+    # one, so a manifest carrying a second `version = "..."` line — a tool
+    # table with its own — would pass the check and get the wrong line bumped.
+    found = len(_VERSION_LINE.findall(text))
+    if found != 1:
+        raise SystemExit(f"{MANIFEST}: found {found} version lines to bump, expected exactly 1")
+    return _VERSION_LINE.sub(f'version = "{version}"', text, count=1)
 
 
 def main() -> None:

@@ -99,3 +99,9 @@ def test_manifest_bump_replaces_the_project_version():
 def test_manifest_bump_refuses_a_file_with_no_version():
     with pytest.raises(SystemExit):
         changelog.bump_manifest('[project]\nname = "x"\n', "0.2.0")
+
+
+def test_manifest_bump_refuses_a_second_version_line():
+    manifest = '[project]\nversion = "0.1.0"\n\n[tool.other]\nversion = "9.9.9"\n'
+    with pytest.raises(SystemExit):
+        changelog.bump_manifest(manifest, "0.2.0")

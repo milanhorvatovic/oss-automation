@@ -21,8 +21,9 @@ name: Dependabot Reconciler
 #         pull-requests: read
 #         actions: read
 #       uses: <owner>/oss-automation/.github/workflows/dependabot-reconciler.yaml@<sha>
+#       with:
+#         automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
 #       secrets:
-#         automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
 #         automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
 #
 # The permissions block is required verbatim: a called workflow can only
@@ -38,9 +39,11 @@ name: Dependabot Reconciler
 #
 # No trust guards in the caller: nothing here runs from a PR event or
 # executes PR code, and every candidate PR is re-verified inside the
-# sweep. The only input is policy-workflow — the repository-qualified
-# identity of the policy workflow the re-drive may re-run, defaulting to
-# this repository's own; forks of the fleet home override it. No
+# sweep. Two inputs: policy-workflow — the repository-qualified identity
+# of the policy workflow the re-drive may re-run, defaulting to this
+# repository's own; forks of the fleet home override it — and
+# automation-client-id, the App identifier a caller passes from its own
+# repository variable, the private key staying a secret. No
 # privileged-dependencies input — that list gates only approval, and the
 # approve decision is never made here (see below).
 # Optional: granting the App the Actions repository permission (read and
@@ -144,7 +147,8 @@ name: Dependabot Reconciler
 #
 # Schedule and workflow_dispatch events read the calling repository's
 # Actions secret store — the store the policy contract already requires
-# the App credential pair to be mirrored into.
+# the App's private key to live in. The client id is not read from there
+# at all; it arrives as an input.
 #
 # Checkout-free on purpose: PR code never executes here.
 
@@ -165,10 +169,15 @@ on:
         required: false
         type: string
         default: milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
-    secrets:
       automation-client-id:
-        description: Client ID of the GitHub App that arms and disarms.
+        description: >-
+          Client ID of the GitHub App that arms and disarms. An identifier
+          rather than a credential, so it travels as a repository
+          variable the caller passes in; the key it pairs with is the
+          secret below.
         required: true
+        type: string
+    secrets:
       automation-private-key:
         description: Private key of the same GitHub App.
         required: true
@@ -267,17 +276,19 @@ jobs:
       cancel-in-progress: false
     env:
       # Step `if:` conditions cannot read the secrets context; surface the
-      # presence of the App credential here (a boolean, never the value).
-      AUTOMATION_SECRET_PRESENT: ${{ secrets.automation-client-id != '' }}
+      # presence of the App credentials here (a boolean, never the value).
+      # Both halves, because either alone is unusable: an id without its
+      # key mints nothing, and a key without its id names no App.
+      AUTOMATION_CREDENTIALS_PRESENT: ${{ inputs.automation-client-id != '' && secrets.automation-private-key != '' }}
       GH_REPO: ${{ github.repository }}
       PR_NUMBER: ${{ matrix.pr }}
     steps:
       - name: Mint the automation-bot token
         id: bot-token
-        if: env.AUTOMATION_SECRET_PRESENT == 'true'
+        if: env.AUTOMATION_CREDENTIALS_PRESENT == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.automation-client-id }}
+          client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
           # Downscope from the App's full installation grant to what this
           # job calls: auto-merge and update-branch live under contents.
@@ -354,7 +365,7 @@ jobs:
             echo "The veto label is no longer present; leaving auto-merge as it is."
             exit 0
           fi
-          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+          if [[ "${AUTOMATION_CREDENTIALS_PRESENT}" != "true" ]]; then
             # A merged PR reads autoMergeRequest null too; the sentinel
             # must not call the hold effective when the merge already
             # fired.
@@ -411,7 +422,7 @@ jobs:
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
-          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+          if [[ "${AUTOMATION_CREDENTIALS_PRESENT}" != "true" ]]; then
             bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
               --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
             # A merged PR reads an empty armer too; the sentinel must
@@ -427,7 +438,7 @@ jobs:
             fi
             armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
             if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
-              echo "::error::A bot-authored approval or bot-armed auto-merge exists on PR #${PR_NUMBER}, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
+              echo "::error::A bot-authored approval or bot-armed auto-merge exists on PR #${PR_NUMBER}, but the App credentials are absent, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
               exit 1
             fi
             echo "No bot approval or bot-armed auto-merge present; nothing to revoke."
@@ -572,7 +583,7 @@ jobs:
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
         run: |
           set -euo pipefail
-          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+          if [[ "${AUTOMATION_CREDENTIALS_PRESENT}" != "true" ]]; then
             bot_approvals=$(gh api "repos/${GH_REPO}/pulls/${PR_NUMBER}/reviews" --paginate \
               --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
             # A merged PR reads an empty armer too; the sentinel must
@@ -588,7 +599,7 @@ jobs:
             fi
             armed_by=$(jq -r '.autoMergeRequest.enabledBy.login // ""' <<<"$arm_info")
             if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
-              echo "::error::PR #${PR_NUMBER} carries unverifiable commits alongside a bot approval or bot-armed auto-merge, and the automation-client-id secret is empty, so nothing can revoke it. Restore the App credentials or clean the PR up manually."
+              echo "::error::PR #${PR_NUMBER} carries unverifiable commits alongside a bot approval or bot-armed auto-merge, and the App credentials are absent, so nothing can revoke it. Restore the App credentials or clean the PR up manually."
               exit 1
             fi
             echo "Tampered update with no bot automation present; nothing to revoke without credentials."
@@ -674,10 +685,10 @@ jobs:
       # PR unreconciled forever.
       - name: Fail on missing credentials with the switch on
         if: >-
-          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT != 'true'
+          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_CREDENTIALS_PRESENT != 'true'
         run: |
           set -euo pipefail
-          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the automation-client-id secret is empty: PR #${PR_NUMBER} is verified and awaiting automation nothing can perform. Configure the App credentials or turn the kill switch off."
+          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the App credentials are absent: PR #${PR_NUMBER} is verified and waiting on automation that cannot run without them. Configure the App credentials or turn the kill switch off."
           exit 1
 
       # Restores policy's arm invariant on a verified PR: unarmed gets
@@ -699,7 +710,7 @@ jobs:
       - name: Arm squash auto-merge
         id: arm
         if: >-
-          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_SECRET_PRESENT == 'true'
+          steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_CREDENTIALS_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           # The bot token carries no Actions scope; the trust check's two
@@ -1270,7 +1281,7 @@ jobs:
         continue-on-error: true
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.automation-client-id }}
+          client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
           permission-actions: write
 

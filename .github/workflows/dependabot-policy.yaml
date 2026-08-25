@@ -78,7 +78,8 @@ name: Dependabot Policy
 # review events are treated as fork events and read the Dependabot store;
 # pull_request_target is not on that list, so every event a caller sends —
 # Dependabot's own and a maintainer's labels alike — reads the Actions
-# store, and the credential pair belongs there alone. The documented
+# store, and the App's private key belongs there alone — its client id
+# travels beside it as a repository variable the caller passes in. The documented
 # exception is a pull request whose base ref is itself a Dependabot
 # branch, which degrades to no secrets at all; the missing-credential step
 # below fails loudly rather than letting a run proceed uncredentialed.
@@ -93,10 +94,15 @@ on:
           are still armed, so a maintainer's approval completes the merge.
         required: true
         type: string
-    secrets:
       automation-client-id:
-        description: Client ID of the GitHub App that approves and arms.
+        description: >-
+          Client ID of the GitHub App that approves and arms. An identifier
+          rather than a credential, so it travels as a repository
+          variable the caller passes in; the key it pairs with is the
+          secret below.
         required: true
+        type: string
+    secrets:
       automation-private-key:
         description: Private key of the same GitHub App.
         required: true
@@ -132,8 +138,10 @@ jobs:
       cancel-in-progress: false
     env:
       # Step `if:` conditions cannot read the secrets context; surface the
-      # presence of the App credential here (a boolean, never the value).
-      AUTOMATION_SECRET_PRESENT: ${{ secrets.automation-client-id != '' }}
+      # presence of the App credentials here (a boolean, never the value).
+      # Both halves, because either alone is unusable: an id without its
+      # key mints nothing, and a key without its id names no App.
+      AUTOMATION_CREDENTIALS_PRESENT: ${{ inputs.automation-client-id != '' && secrets.automation-private-key != '' }}
     steps:
       - name: Fetch Dependabot metadata
         id: metadata
@@ -221,10 +229,10 @@ jobs:
       # job's `if:`; the steps below re-check the live label state.
       - name: Mint the automation-bot token
         id: bot-token
-        if: env.AUTOMATION_SECRET_PRESENT == 'true'
+        if: env.AUTOMATION_CREDENTIALS_PRESENT == 'true'
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.automation-client-id }}
+          client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
           # Downscope from the App's full installation grant to what these
           # jobs call: merge rights for auto-merge live under contents.
@@ -257,10 +265,10 @@ jobs:
             echo "No live veto label; policy continues."
             exit 0
           fi
-          if [[ "${AUTOMATION_SECRET_PRESENT}" != "true" ]]; then
+          if [[ "${AUTOMATION_CREDENTIALS_PRESENT}" != "true" ]]; then
             armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null' || echo "unknown")
             if [[ "$armed" != "false" ]]; then
-              echo "::error::A live veto label is present and auto-merge is armed, but the App credential is empty so it cannot be disarmed. Restore the credentials or disarm manually."
+              echo "::error::A live veto label is present and auto-merge is armed, but the App credentials are absent so it cannot be disarmed. Restore them or disarm manually."
               exit 1
             fi
             echo "Live veto with nothing armed; the hold is effective without credentials."
@@ -326,7 +334,7 @@ jobs:
       # this context required blocks the merge).
       - name: Verify no stale automation exists without credentials
         if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT != 'true'
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_CREDENTIALS_PRESENT != 'true'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           REPO: ${{ github.repository }}
@@ -338,7 +346,7 @@ jobs:
             --jq '.[] | select(.state == "APPROVED" and (.user.login | endswith("[bot]"))) | .id' | wc -l | tr -d ' ')
           armed_by=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest.enabledBy.login // ""')
           if [[ "$bot_approvals" != "0" || "$armed_by" == *"[bot]" ]]; then
-            echo "::error::A bot-authored approval or bot-armed auto-merge exists on this PR, but the automation-client-id secret is empty, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
+            echo "::error::A bot-authored approval or bot-armed auto-merge exists on this PR, but the App credentials are absent, so it cannot be attributed or revoked. Restore the App credentials or clean the PR up manually."
             exit 1
           fi
           echo "No bot approval or bot-armed auto-merge present; nothing to revoke."
@@ -355,7 +363,7 @@ jobs:
       # same stance as the veto disarm.
       - name: Revoke stale approval and arm
         if: >-
-          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_SECRET_PRESENT == 'true'
+          (steps.effective.outputs.update-type == 'version-update:semver-major' || steps.privileged.outputs.privileged-hit == 'true' || steps.authorship.outputs.dependabot-only == 'false' || vars.DEPENDABOT_AUTOMERGE_ENABLED != 'true') && env.AUTOMATION_CREDENTIALS_PRESENT == 'true'
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           BOT_LOGIN: ${{ steps.bot-token.outputs.app-slug }}[bot]
@@ -570,7 +578,7 @@ jobs:
         id: bot-token
         uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
         with:
-          client-id: ${{ secrets.automation-client-id }}
+          client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
           # Downscope from the App's full installation grant to what these
           # jobs call: merge rights for auto-merge live under contents.

@@ -96,8 +96,8 @@ jobs:
         milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml
         actions/create-github-app-token
         dependabot/fetch-metadata
+      automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
     secrets:
-      automation-client-id: ${{ secrets.AUTOMATION_CLIENT_ID }}
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
 
   gate:

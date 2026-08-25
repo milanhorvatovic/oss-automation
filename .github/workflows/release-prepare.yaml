@@ -1,0 +1,130 @@
+name: Prepare Release
+
+# Cuts the release commit so nobody hand-edits three files that have to agree.
+# release-tag.yaml refuses to publish unless the tag, the manifest version and
+# a '## [X.Y.Z]' changelog section all match, and getting one of the three
+# wrong is discovered at publish time, after the tag is already pushed.
+#
+# The changelog body comes from GitHub's own release-notes generator
+# (POST /releases/generate-notes), the same content release-tag appends to the
+# published release — so the section written here and the notes GitHub renders
+# describe the same set of pull requests rather than two hand-kept lists that
+# drift. Categories come from .github/release.yml when that file exists.
+#
+# Anything already written under '## [Unreleased]' is carried into the new
+# section above the generated list rather than replaced. Prose explaining why a
+# release matters is worth more than a pull-request inventory and no generator
+# will produce it; the inventory is what nobody should have to type.
+#
+# Opens a pull request rather than pushing: the default branch's ruleset
+# requires review and a green gate, and a release commit is not the one to
+# exempt. The App token is not a preference here — a pull request opened with
+# GITHUB_TOKEN never triggers the caller's other workflows, so its gate context
+# would never report and the pull request could not merge.
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Version to release, without the leading v (e.g. 0.1.1).
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Mint the automation-bot token
+        id: bot-token
+        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        with:
+          client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
+          private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}
+          permission-contents: write
+          permission-pull-requests: write
+
+      - name: Check out the default branch
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          token: ${{ steps.bot-token.outputs.token }}
+          # The generator needs the tag history to bound the previous release.
+          fetch-depth: 0
+
+      - name: Refuse a version that is not release-shaped
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # Guarding the input rather than the tag: release-tag compares the
+          # manifest against the tag minus its leading v as an exact string, so
+          # a 'v' typed here would travel into pyproject.toml and fail there.
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)$ ]]; then
+            echo "::error::version '${VERSION}' is not a release version; pass it without a leading v (e.g. 0.1.1)."
+            exit 1
+          fi
+          if git rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
+            echo "::error::tag v${VERSION} already exists; releasing it again would need the tag deleted first."
+            exit 1
+          fi
+
+      - name: Generate the changelog section and bump the manifest
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+        run: |
+          set -euo pipefail
+          # An empty previous tag is the first release, where the generator
+          # covers the whole history — which is what a first changelog wants.
+          previous=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          args=(-f tag_name="v${VERSION}" -f target_commitish="${GITHUB_REF_NAME}")
+          if [[ -n "$previous" ]]; then
+            args+=(-f previous_tag_name="$previous")
+          fi
+          gh api -X POST "repos/${GH_REPO}/releases/generate-notes" "${args[@]}" --jq '.body' > "${RUNNER_TEMP}/generated-notes.md"
+          python3 .github/scripts/write_changelog_section.py \
+            --version "$VERSION" \
+            --date "$(date -u +%Y-%m-%d)" \
+            --notes "${RUNNER_TEMP}/generated-notes.md" \
+            --repo "$GH_REPO"
+
+      - name: Open the release pull request
+        env:
+          GH_TOKEN: ${{ steps.bot-token.outputs.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ inputs.version }}
+          APP_SLUG: ${{ steps.bot-token.outputs.app-slug }}
+        run: |
+          set -euo pipefail
+          branch="release/v${VERSION}"
+          git switch -c "$branch"
+          git config user.name "${APP_SLUG}[bot]"
+          # The App's noreply address, so the commit attributes to the App
+          # rather than to whoever dispatched the workflow.
+          git config user.email "${APP_SLUG}[bot]@users.noreply.github.com"
+          git add CHANGELOG.md pyproject.toml
+          git commit -m "Release v${VERSION}"
+          git push origin "$branch"
+          # Heredoc at the block scalar's own indentation: YAML strips those
+          # ten columns before bash sees the script, so the fence below lands
+          # at column zero in the pull-request body.
+          cat > "${RUNNER_TEMP}/release-pr-body.md" <<EOF
+          Prepared by \`release-prepare.yaml\`. The changelog section is GitHub's generated release notes for this range; anything written under Unreleased was carried across above it.
+
+          Review the section, then merge and push the tag:
+
+          \`\`\`
+          git tag v${VERSION} && git push origin v${VERSION}
+          \`\`\`
+
+          \`release-tag.yaml\` verifies that the tag, the manifest version and this section agree before it publishes.
+          EOF
+          gh pr create \
+            --base "${GITHUB_REF_NAME}" \
+            --head "$branch" \
+            --title "Release v${VERSION}" \
+            --body-file "${RUNNER_TEMP}/release-pr-body.md"

@@ -27,8 +27,8 @@ Branch from `main` with a `feature/<slug>` name. Keep one logical change per pul
 Before pushing:
 
 ```bash
-ruff check src tests
-ruff format --check src tests
+ruff check src tests .github/scripts
+ruff format --check src tests .github/scripts
 pytest
 pytest --pyargs oss_automation_guards
 ```
@@ -72,7 +72,7 @@ Every pull request needs the `gate` status check green and one approving review.
 
 ## Releasing
 
-Maintainer task, documented in the [README](README.md#releasing): bump `[project] version` in `pyproject.toml`, move the `Unreleased` changelog content under a dated `## [X.Y.Z]` section, merge, then push the `vX.Y.Z` tag. The release workflow verifies tag, manifest, and changelog agree before it publishes anything, so a mismatch fails the release rather than shipping one.
+Maintainer task, documented in the [README](README.md#releasing): dispatch the **Prepare Release** workflow with the version, review the pull request it opens, merge it, then push the `vX.Y.Z` tag. The changelog section is generated rather than written — add prose under `## [Unreleased]` only when a release needs explaining beyond its list of pull requests, and the prepare step carries it across. The release workflow verifies tag, manifest, and changelog agree before it publishes anything, so a mismatch fails the release rather than shipping one.
 
 ## Contribution basis
 

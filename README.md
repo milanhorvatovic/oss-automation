@@ -16,7 +16,7 @@ This repository is the first consumer of its own Dependabot flavors, and both of
 
 Release automation ships in two reusable flavors, so integrators pick the one matching their commit convention: **`release-tag`** (tag-driven — the caller verifies with its own jobs, then the workflow checks tag/manifest/changelog parity and publishes the GitHub Release with the changelog section as curated notes and GitHub's generated notes appended) and **`release-please`** (Conventional-Commits driven — a bot-maintained release PR accumulates the bump and changelog; requires the caller's commits or squash titles to follow Conventional Commits).
 
-This repository itself releases from `main` with the tag-driven flavor: bump `[project] version` in `pyproject.toml`, move the `Unreleased` changelog content under a dated `## [X.Y.Z]` section, merge, then push the `vX.Y.Z` tag.
+This repository itself releases from `main` with the tag-driven flavor, and does not hand-edit the three files that have to agree. Run the **Prepare Release** workflow with the version: it opens a pull request bumping `[project] version` in `pyproject.toml` and promoting `## [Unreleased]` into a dated `## [X.Y.Z]` section whose body is GitHub's generated release notes for the range, with anything already written under `Unreleased` carried across above the generated list. Merge that pull request, then push the `vX.Y.Z` tag.
 
 ## Status
 

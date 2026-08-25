@@ -1,0 +1,20 @@
+# Review routing. Every path has the same owner today; the file exists so that
+# ownership is declared rather than inferred, and so a second maintainer is a
+# one-line change rather than a new convention.
+#
+# The default branch ruleset deliberately does NOT require code-owner review.
+# That is not an oversight: CODEOWNERS resolves to users and teams, a GitHub App
+# can never be one, and this repository's Dependabot policy merges eligible
+# bumps on the automation App's approval. Turning require_code_owner_review on
+# would leave every App-approved pull request sitting at REVIEW_REQUIRED with
+# nothing failing — the approval posts, auto-merge stays armed, and the merge
+# never fires. If a second human joins and code-owner review becomes worth
+# requiring, note that a ruleset cannot scope that requirement by changed
+# path — its conditions match refs, and only the patterns in this file decide
+# which paths need an owner's review. Requiring it while `*` owns everything
+# therefore holds every bot pull request; narrowing these patterns to paths
+# Dependabot never bumps is the only way to have both, and the paths worth
+# owning are largely the ones it bumps. Verify a bot pull request still merges
+# before relying on any of it.
+
+* @milanhorvatovic

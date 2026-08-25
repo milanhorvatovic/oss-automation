@@ -38,8 +38,8 @@ pytest --pyargs oss_automation_guards
 Any workflow file you add or edit must satisfy the structural rules, or CI fails:
 
 - Every runner job declares a `timeout-minutes`. Jobs that only call a reusable workflow (`uses:`) are exempt — Actions rejects the key there, and the callee's own jobs carry it instead.
-- Every third-party action is pinned to a full 40-character commit SHA with a trailing comment naming the pinned version (`# v7.0.1`). A comment that merely contains a digit does not satisfy this.
-- Default-token write scopes are declared explicitly rather than inherited.
+- Every third-party action is pinned to an immutable revision, with a trailing comment naming the pinned version (`# v7.0.1`): a full 40-character commit SHA for a repository action, or a `sha256:` image digest for a `docker://` one. A comment that merely contains a digit does not satisfy this.
+- Every job is covered by an explicit `permissions:` block at the workflow or the job level. Inheriting the repository's default fails the guard even when that default is read-only: the scopes have to be stated where a reader of the file can see them.
 - A PR-triggered workflow that holds credentials is bound to its declared trust model.
 
 The last one is the rule most likely to surprise you. A workflow that gains a `secrets:` reference or a write scope becomes credentialed in the guards' eyes and must carry the matching trust guards; if a file is a deliberate exception, declare it through the `guards_trust_exempt` pytest ini option rather than weakening the guard.

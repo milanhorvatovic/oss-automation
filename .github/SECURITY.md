@@ -28,4 +28,4 @@ Out of scope: behaviour that requires a consumer to have disabled a documented r
 
 ## Reporting a weakness in your own repository
 
-If you run these workflows and believe your repository merged something it should not have, the artefacts worth attaching are the run logs of the `caller` and `gate` jobs, the pull request's commit list, and the resolved value of `DEPENDABOT_AUTOMERGE_ENABLED` at the time. The policy logs its switch state on every run precisely so that this question has an answer.
+If you run these workflows and believe your repository merged something it should not have, the artefacts worth attaching are the run logs of the `caller` and `gate` jobs, the pull request's commit list, and the resolved value of `DEPENDABOT_AUTOMERGE_ENABLED` at the time. The policy job logs that value on every run it makes, so the logs usually answer this question outright. A pull request carrying a veto label is the exception: it skips the policy job for the disarm path, which logs no switch state.

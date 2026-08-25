@@ -4,8 +4,42 @@ name: Dependabot Automerge
 # contract documented in dependabot-policy.yaml's header. The `edited`
 # trigger type is load-bearing there: a base retarget emits only `edited`.
 
+# pull_request_target, not pull_request, and the difference is the whole
+# trust model. This workflow hands the App credentials to a reusable
+# workflow, and on pull_request the file naming that workflow is read from
+# the merge ref — so the pull request would choose the code the credentials
+# reach, whether by editing a locally referenced callee or by moving the SHA
+# a pinned one names. pull_request_target reads this file from the default
+# branch, so the delegation, the guards below and the privileged list are
+# the ones a maintainer merged, and a bump is judged by code it did not
+# supply.
+#
+# The default branch, specifically, and not the branch the pull request
+# targets: since 8 December 2025 GitHub resolves a pull_request_target
+# workflow's source, GITHUB_REF and GITHUB_SHA from the default branch
+# whatever the base is, so that a stale workflow on some other branch
+# cannot be selected by choosing it as a base. A pull request targeting
+# anything else would therefore be judged by a caller and a privileged
+# list its own base does not carry, which is why the guard below refuses
+# to delegate for one at all.
+#
+# The usual objection to pull_request_target is that it pairs credentials
+# with a checkout of pull-request code, which is how it earns its
+# reputation. Nothing here checks out, and the callee is checkout-free by
+# design, so no pull-request code executes in a credentialed job. That is
+# the property that makes this trigger correct here rather than merely
+# convenient, and it is worth re-reading before any step in this file or its
+# callee gains a checkout.
+#
+# Dependabot's pull_request events are treated as fork events — read-only
+# token, Dependabot secrets only — while pull_request_target is not on that
+# list and reads the Actions store like any other run. The exception is a
+# pull request whose base ref is itself a Dependabot branch, which degrades
+# to no secrets; the callee already fails loudly on absent credentials
+# rather than proceeding without them.
+
 on:
-  pull_request:
+  pull_request_target:
     types:
       - opened
       - reopened
@@ -19,144 +53,31 @@ permissions:
   pull-requests: read
 
 jobs:
-  scope:
-    # On pull_request this caller is itself read from the merge ref, so the
-    # pull request chooses which code gets handed the App secrets. A local
-    # reference lets it supply the callee's content; a pinned reference lets
-    # it supply the callee's identity, by moving the SHA the `uses:` line
-    # names. Both arrive at one place — a bump judged by the code that bump
-    # introduces, for which the privileged-dependencies list is something to
-    # honour or ignore as it chooses. This job answers whether the pull
-    # request edits the automation tree, and the caller refuses to delegate
-    # when it does. It outlives the local reference below.
-    if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    outputs:
-      touches-workflow-tree: ${{ steps.tree.outputs.touches-workflow-tree }}
-      # Why the hold happened, so a maintainer reading the gate can tell a
-      # pull request that edits the tree from a comparison that could not be
-      # read. Both hold; only one is a statement about the pull request.
-      hold-reason: ${{ steps.tree.outputs.hold-reason }}
-    steps:
-      - name: Check whether the pull request edits the workflow tree
-        id: tree
-        env:
-          GH_TOKEN: ${{ github.token }}
-          REPOSITORY: ${{ github.repository }}
-          BASE_SHA: ${{ github.event.pull_request.base.sha }}
-          HEAD_SHA: ${{ github.event.pull_request.head.sha }}
-        run: |
-          set -euo pipefail
-          # Read from the API rather than a checkout: the payload carries a
-          # changed-file count but no paths, and checking out the merge ref
-          # to answer the question would run this repository's own tree from
-          # the pull request — the exposure the question exists to avoid.
-          #
-          # Compared at the event's own two commits, never at the pull
-          # request's live head. What this run executes is the merge of the
-          # head that raised the event, while a files-of-this-PR query
-          # answers for whatever head the branch carries when the query
-          # lands — and heads move here as a matter of course, since
-          # Dependabot rebases and the reconciler updates branches. A head
-          # that edits the automation tree, replaced before the query, would
-          # otherwise be judged by a later head that does not.
-          if ! comparison=$(gh api "repos/${REPOSITORY}/compare/${BASE_SHA}...${HEAD_SHA}"); then
-            echo "::warning::Failed to compare ${BASE_SHA}...${HEAD_SHA}; holding rather than delegating on a file list that was never read."
-            echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
-            echo "hold-reason=comparison-unreadable" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # The comparison carries at most 300 files, and says so by
-          # reaching the cap rather than by a flag; at the cap the list is
-          # no longer an answer, so it is not treated as one.
-          file_count=$(jq -r '.files | length' <<<"$comparison")
-          if [[ "$file_count" -ge 300 ]]; then
-            echo "::warning::The comparison lists ${file_count} files, at the API's cap; holding rather than delegating on a truncated file list."
-            echo "touches-workflow-tree=true" >> "$GITHUB_OUTPUT"
-            echo "hold-reason=comparison-truncated" >> "$GITHUB_OUTPUT"
-            exit 0
-          fi
-          # Both sides of a rename: the comparison reports the destination
-          # in filename and the source in previous_filename, so reading the
-          # destination alone would let a file renamed out of the automation
-          # tree answer for a tree it just left.
-          files=$(jq -r '.files[]? | (.filename, .previous_filename) | select(. != null and . != "")' <<<"$comparison")
-          # Keyed on the whole of .github, not just workflows/: today a policy
-          # run executes only what the workflow tree defines, since the callee
-          # is checkout-free, but a local composite action added later would
-          # live beside it and escape the narrower prefix. Dependabot only
-          # ever edits .github/workflows here, so the wider prefix holds
-          # nothing extra in practice.
-          touched=false
-          while IFS= read -r file; do
-            case "$file" in
-              .github/*)
-                touched=true
-                break
-                ;;
-            esac
-          done <<<"$files"
-          echo "Pull request edits the automation tree: ${touched}."
-          echo "touches-workflow-tree=${touched}" >> "$GITHUB_OUTPUT"
-          if [[ "$touched" == "true" ]]; then
-            echo "hold-reason=edits-automation-tree" >> "$GITHUB_OUTPUT"
-          else
-            echo "hold-reason=" >> "$GITHUB_OUTPUT"
-          fi
-
   caller:
-    needs: scope
     # Trust guards per the policy contract: keyed on the PR author, never
     # github.actor (the reconciler's branch updates emit synchronize events
-    # whose actor is the App), plus the same-repo head pin. The third
-    # conjunct is the bound described on the scope job.
+    # whose actor is the App), plus the same-repo head pin. They carry more
+    # weight on this trigger than they did on pull_request: every pull
+    # request now reaches a workflow holding credentials, and these
+    # conjuncts are what keep the delegation to Dependabot's own same-repo
+    # branches.
     #
-    # What these guards bind, and what they do not. Every control in this
-    # file — both pins and the scope job's answer — is read from the merge
-    # ref, so all of it binds content Dependabot authored and nothing past
-    # that. An actor with write access can append a commit to a Dependabot
-    # branch: the pull request's author stays the bot while the head commits
-    # are theirs, and that commit can rewrite these conditions or repoint
-    # `uses:` at a workflow of their own with the secrets still mapped. A
-    # pinned callee is not protection from it — the pin is a line in the
-    # same pull-request-supplied file. The callee's authorship check refuses
-    # to approve a tampered head, which covers the case where the callee is
-    # still the real one, and covers nothing when the same commit chose
-    # which callee runs. Binding that actor takes base-anchored code: a
-    # ruleset restricting updates to dependabot/** with the bot as the only
-    # bypass, which is listed with the other activation switches, and at
-    # fleet level the question of whether these callers belong on
-    # pull_request_target instead.
+    # The third conjunct holds the delegation to pull requests targeting
+    # the default branch, because that is the only base for which what
+    # runs and what the pull request is measured against are the same
+    # tree. A Dependabot `target-branch` pull request would be judged by
+    # the default branch's caller, list and policy while its own base
+    # carries others, and every downstream parity check — the sweep's
+    # trust archaeology, its re-drive — compares against that base. Left
+    # for a maintainer rather than decided by a configuration nobody
+    # reading the pull request would think to look at.
     if: >-
-      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && needs.scope.outputs.touches-workflow-tree == 'false'
-    # A local reference where the contract asks consumers for a full commit
-    # SHA: until the first tagged release there is no version for a pin
-    # comment to name, and the guards reject one that names a branch and a
-    # date instead. The privileged list below cannot make that safe on its
-    # own — the tier decision reads dependencyName and updateType out of
-    # fetch-metadata's output, so a bumped fetch-metadata classifies its own
-    # bump, and a bumped create-github-app-token receives the App private
-    # key outright; either could mint the approval rather than wait for one.
-    # What bounds it is the scope job: no delegation at all while the pull
-    # request edits .github/**, which covers every bump that could reach
-    # this job's code. Such a pull request is left for a maintainer.
-    # The reconciler's failed-run re-drive used to carry a residual here:
-    # it held only the caller file to base parity, which settles what
-    # re-runs for a callee named by commit and says nothing about one
-    # reached through a ref, so a re-drive could execute a policy version
-    # the base branch had replaced. It now reads the run's own record of
-    # which commit it loaded the policy from and compares that copy with
-    # the base tip's, so the residual is closed for this local reference
-    # and stays closed after the pin.
-    # Restore `@<sha> # vX.Y.Z` at the first release. The scope job does not
-    # go with it, and an earlier revision of this branch was wrong to say it
-    # would: a pinned reference is read from the merge ref exactly as a local
-    # one is, so a pull request bumping that pin selects the policy that
-    # judges the bump, and the privileged list is once again the bumped
-    # code's to honour. What the release ends is the local reference — not
-    # the need for this conjunct.
+      github.event.pull_request.user.login == 'dependabot[bot]' && github.event.pull_request.head.repo.full_name == github.repository && github.event.pull_request.base.ref == github.event.repository.default_branch
+    # Local rather than pinned, and on this trigger that is a preference
+    # rather than a risk: the reference resolves against the default
+    # branch, so it names the policy this repository merged. Pinning at a release
+    # remains open as dogfooding — the fleet home consuming itself the way
+    # its consumers do — and the reconciler's re-drive verifies either form.
     uses: ./.github/workflows/dependabot-policy.yaml
     with:
       # A compromised bump of any of these touches the fleet's trust root:
@@ -164,11 +85,12 @@ jobs:
       # action mints the App token, the other parses Dependabot metadata
       # the policy trusts. Their updates are armed but held for a
       # maintainer — a malicious tag must never ride its own policy to an
-      # auto-merged pin bump. The fleet home is named by the two workflow
-      # paths rather than by the repository: Dependabot names a reusable
-      # workflow dependency by its repository-qualified path, and the
-      # policy matches names exactly, so a bare `milanhorvatovic/
-      # oss-automation` would never match the bump it is meant to hold.
+      # auto-merged pin bump. That hold is real on this trigger: the policy
+      # weighing the list is the default branch's, not the one the bump
+      # carries. The fleet home is named by the two workflow paths rather
+      # than by the repository, because Dependabot names a reusable
+      # workflow dependency by its repository-qualified path and the policy
+      # matches names exactly.
       privileged-dependencies: |
         milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
         milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml
@@ -181,47 +103,19 @@ jobs:
   gate:
     # The consumer contract's always-run gate: the trust-guarded caller job
     # skips on non-Dependabot PRs and a skipped job reports as passing, so
-    # this context — not the callee's — is the one the ruleset requires. It
-    # watches the scope job too: a scope failure skips the caller, and a
-    # skipped caller must not read as a clean policy run.
-    needs:
-      - scope
-      - caller
+    # this context — not the callee's — is the one the ruleset requires.
+    needs: caller
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
     steps:
       - name: Fail on a failed or cancelled policy run
         env:
-          SCOPE_RESULT: ${{ needs.scope.result }}
-          CALLER_RESULT: ${{ needs.caller.result }}
-          HOLD_REASON: ${{ needs.scope.outputs.hold-reason }}
+          RESULT: ${{ needs.caller.result }}
         run: |
           set -euo pipefail
-          for stage in scope caller; do
-            case "$stage" in
-              scope) result="$SCOPE_RESULT" ;;
-              caller) result="$CALLER_RESULT" ;;
-            esac
-            if [[ "$result" == "failure" || "$result" == "cancelled" ]]; then
-              echo "::error::The Dependabot ${stage} job concluded ${result}."
-              exit 1
-            fi
-          done
-          # Each hold reads differently to whoever is looking at this
-          # context. Only the first is a statement about the pull request;
-          # the other two are the check declining to guess, and saying so
-          # here is what keeps them diagnosable rather than indistinguishable
-          # from a finding.
-          case "$HOLD_REASON" in
-            edits-automation-tree)
-              echo "::notice::This pull request edits .github/**, so it would supply the code that judges it. No delegation; it waits for a maintainer."
-              ;;
-            comparison-unreadable)
-              echo "::notice::The scope check could not read this pull request's comparison and held it rather than assuming an answer. No delegation; it waits for a maintainer. This says nothing about the pull request's contents."
-              ;;
-            comparison-truncated)
-              echo "::notice::This pull request's comparison reached the API's 300-file cap, so the scope check held it rather than reading a list that had stopped being an answer. No delegation; it waits for a maintainer."
-              ;;
-          esac
-          echo "Scope result: ${SCOPE_RESULT}. Policy result: ${CALLER_RESULT}."
+          if [[ "$RESULT" == "failure" || "$RESULT" == "cancelled" ]]; then
+            echo "::error::The Dependabot policy run concluded ${RESULT}."
+            exit 1
+          fi
+          echo "Policy result: ${RESULT}."

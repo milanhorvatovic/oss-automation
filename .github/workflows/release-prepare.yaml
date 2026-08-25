@@ -66,8 +66,16 @@ jobs:
           # Guarding the input rather than the tag: release-tag compares the
           # manifest against the tag minus its leading v as an exact string, so
           # a 'v' typed here would travel into pyproject.toml and fail there.
-          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.a-zA-Z0-9]*)$ ]]; then
+          if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+([0-9A-Za-z]+)?([-.][0-9A-Za-z]+)*$ ]]; then
             echo "::error::version '${VERSION}' is not a release version; pass it without a leading v (e.g. 0.1.1)."
+            exit 1
+          fi
+          # The pattern above still admits spellings git refuses, and the
+          # failure would otherwise surface at `git switch -c release/v...`
+          # after the notes were already generated. git's own rules are the
+          # authority on what a tag and a branch may be called.
+          if ! git check-ref-format "refs/tags/v${VERSION}" || ! git check-ref-format "refs/heads/release/v${VERSION}"; then
+            echo "::error::version '${VERSION}' does not spell a valid tag and branch name."
             exit 1
           fi
           if git rev-parse --verify --quiet "refs/tags/v${VERSION}" >/dev/null; then
@@ -112,6 +120,7 @@ jobs:
           VERSION: ${{ inputs.version }}
           APP_SLUG: ${{ steps.bot-token.outputs.app-slug }}
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+          BASE_SHA: ${{ github.sha }}
         run: |
           set -euo pipefail
           branch="release/v${VERSION}"
@@ -129,10 +138,14 @@ jobs:
           cat > "${RUNNER_TEMP}/release-pr-body.md" <<EOF
           Prepared by \`release-prepare.yaml\`. The changelog section is GitHub's generated release notes for this range; anything written under Unreleased was carried across above it.
 
-          Review the section, then merge and push the tag:
+          The section covers the default branch at \`${BASE_SHA}\`. Anything merged after that lands in the tag but in no notes, so if the default branch has moved on when you come back to this, close this pull request and dispatch again rather than merging it stale.
+
+          Review the section, then merge and tag that merge commit — not whatever the default branch has advanced to:
 
           \`\`\`
-          git tag v${VERSION} && git push origin v${VERSION}
+          git switch ${DEFAULT_BRANCH} && git pull
+          git tag v${VERSION} <merge-commit-of-this-pull-request>
+          git push origin v${VERSION}
           \`\`\`
 
           \`release-tag.yaml\` verifies that the tag, the manifest version and this section agree before it publishes.

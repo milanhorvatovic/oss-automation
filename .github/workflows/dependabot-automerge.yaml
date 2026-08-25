@@ -80,22 +80,33 @@ jobs:
     # its consumers do — and the reconciler's re-drive verifies either form.
     uses: ./.github/workflows/dependabot-policy.yaml
     with:
-      # A compromised bump of any of these touches the fleet's trust root:
-      # the fleet home hosts the policy these callers delegate to, one
-      # action mints the App token, the other parses Dependabot metadata
-      # the policy trusts. Their updates are armed but held for a
-      # maintainer — a malicious tag must never ride its own policy to an
-      # auto-merged pin bump. That hold is real on this trigger: the policy
-      # weighing the list is the default branch's, not the one the bump
-      # carries. The fleet home is named by the two workflow paths rather
-      # than by the repository, because Dependabot names a reusable
-      # workflow dependency by its repository-qualified path and the policy
-      # matches names exactly.
+      # A compromised bump of any of these touches the fleet's trust root,
+      # so their updates are armed but held for a maintainer — a malicious
+      # tag must never ride its own policy to an auto-merged pin bump. What
+      # puts an entry here is the scope its revision executes under, not the
+      # file it sits in: the two workflow paths carry the policy these
+      # callers delegate to; create-github-app-token and fetch-metadata run
+      # in jobs holding the App credentials; checkout runs in release-tag's
+      # publishing job and release-please-action in release-please's, both
+      # contents: write. Consumers call those two release workflows at a
+      # SHA and execute these pins under their own write tokens, so a bump
+      # merged here runs everywhere. setup-python is deliberately absent —
+      # every job it runs in is contents: read with no secret in scope.
+      # Holding checkout also holds it for those read-only jobs, since
+      # Dependabot names the dependency, not the job.
+      #
+      # That hold is real on this trigger: the policy weighing the list is
+      # the default branch's, not the one the bump carries. The fleet home
+      # is named by the two workflow paths rather than by the repository,
+      # because Dependabot names a reusable workflow dependency by its
+      # repository-qualified path and the policy matches names exactly.
       privileged-dependencies: |
         milanhorvatovic/oss-automation/.github/workflows/dependabot-policy.yaml
         milanhorvatovic/oss-automation/.github/workflows/dependabot-reconciler.yaml
         actions/create-github-app-token
         dependabot/fetch-metadata
+        actions/checkout
+        googleapis/release-please-action
       automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
     secrets:
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

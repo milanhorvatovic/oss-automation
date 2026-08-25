@@ -39,9 +39,11 @@ name: Dependabot Reconciler
 #
 # No trust guards in the caller: nothing here runs from a PR event or
 # executes PR code, and every candidate PR is re-verified inside the
-# sweep. The only input is policy-workflow — the repository-qualified
-# identity of the policy workflow the re-drive may re-run, defaulting to
-# this repository's own; forks of the fleet home override it. No
+# sweep. Two inputs: policy-workflow — the repository-qualified identity
+# of the policy workflow the re-drive may re-run, defaulting to this
+# repository's own; forks of the fleet home override it — and
+# automation-client-id, the App identifier a caller passes from its own
+# repository variable, the private key staying a secret. No
 # privileged-dependencies input — that list gates only approval, and the
 # approve decision is never made here (see below).
 # Optional: granting the App the Actions repository permission (read and
@@ -145,7 +147,8 @@ name: Dependabot Reconciler
 #
 # Schedule and workflow_dispatch events read the calling repository's
 # Actions secret store — the store the policy contract already requires
-# the App credential pair to be mirrored into.
+# the App's private key to live in. The client id is not read from there
+# at all; it arrives as an input.
 #
 # Checkout-free on purpose: PR code never executes here.
 
@@ -685,7 +688,7 @@ jobs:
           steps.authorship.outputs.dependabot-only == 'true' && env.AUTOMATION_CREDENTIALS_PRESENT != 'true'
         run: |
           set -euo pipefail
-          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the App credentials are absent: PR #${PR_NUMBER} is verified and awaiting automation nothing can perform. Configure the App credentials or turn the kill switch off."
+          echo "::error::DEPENDABOT_AUTOMERGE_ENABLED is 'true' but the App credentials are absent: PR #${PR_NUMBER} is verified and waiting on automation that cannot run without them. Configure the App credentials or turn the kill switch off."
           exit 1
 
       # Restores policy's arm invariant on a verified PR: unarmed gets

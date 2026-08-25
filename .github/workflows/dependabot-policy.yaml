@@ -78,7 +78,8 @@ name: Dependabot Policy
 # review events are treated as fork events and read the Dependabot store;
 # pull_request_target is not on that list, so every event a caller sends —
 # Dependabot's own and a maintainer's labels alike — reads the Actions
-# store, and the credential pair belongs there alone. The documented
+# store, and the App's private key belongs there alone — its client id
+# travels beside it as a repository variable the caller passes in. The documented
 # exception is a pull request whose base ref is itself a Dependabot
 # branch, which degrades to no secrets at all; the missing-credential step
 # below fails loudly rather than letting a run proceed uncredentialed.

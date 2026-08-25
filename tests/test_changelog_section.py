@@ -68,6 +68,20 @@ def test_release_page_furniture_is_dropped():
     assert "What's Changed" not in result
 
 
+def test_full_changelog_link_is_dropped_when_it_stands_alone():
+    # The shared fixture reaches "## New Contributors" first, and clean_notes
+    # stops there — so this line is the only thing exercising that branch.
+    notes = (
+        "## What's Changed\n"
+        "* Add a guard by @someone in https://github.com/owner/repo/pull/1\n"
+        "\n"
+        "**Full Changelog**: https://github.com/owner/repo/compare/v0.1.0...v0.2.0\n"
+    )
+    result = rewrite(notes=notes)
+    assert "**Full Changelog**" not in result
+    assert "* Add a guard by @someone" in result
+
+
 def test_unreleased_is_left_empty_for_the_next_cycle():
     result = rewrite()
     unreleased = result.index("## [Unreleased]")

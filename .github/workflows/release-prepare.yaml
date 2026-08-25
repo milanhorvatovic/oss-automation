@@ -111,9 +111,15 @@ jobs:
           DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
         run: |
           set -euo pipefail
-          # An empty previous tag is the first release, where the generator
-          # covers the whole history — which is what a first changelog wants.
-          previous=$(git tag --list 'v*' --sort=-v:refname | head -n1 || true)
+          # Reachability, not version sort. `--sort=-v:refname` orders suffixes
+          # lexically unless versionsort.suffix is configured, so with both
+          # v1.0.0 and v1.0.0rc1 present it can name the release candidate as
+          # the latest, and it happily returns a higher-numbered tag from a
+          # branch this commit does not contain. describe walks the ancestry
+          # of the commit being released, which is the range the notes are
+          # about. Empty output is the first release, where the generator
+          # covers the whole history — what a first changelog wants.
+          previous=$(git describe --tags --abbrev=0 --match 'v*' HEAD 2>/dev/null || true)
           # The commit this run actually prepared, not the branch name: the
           # default branch can advance between checkout and this call, and
           # github.sha names whichever ref the dispatch selected rather than

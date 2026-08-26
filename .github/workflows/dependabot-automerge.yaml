@@ -90,10 +90,12 @@ jobs:
       # publishing job and release-please-action in release-please's, both
       # contents: write. Consumers call those two release workflows at a
       # SHA and execute these pins under their own write tokens, so a bump
-      # merged here runs everywhere. setup-python is deliberately absent —
-      # every job it runs in is contents: read with no secret in scope.
-      # Holding checkout also holds it for those read-only jobs, since
-      # Dependabot names the dependency, not the job.
+      # merged here runs everywhere. scorecard-action and codeql-action run
+      # only here rather than in a consumer's tree, but under id-token and
+      # security-events write, which is the same test. setup-python is
+      # deliberately absent — every job it runs in is contents: read with no
+      # secret in scope. Holding checkout also holds it for those read-only
+      # jobs, since Dependabot names the dependency, not the job.
       #
       # That hold is real on this trigger: the policy weighing the list is
       # the default branch's, not the one the bump carries. The fleet home
@@ -107,6 +109,8 @@ jobs:
         dependabot/fetch-metadata
         actions/checkout
         googleapis/release-please-action
+        ossf/scorecard-action
+        github/codeql-action
       automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
     secrets:
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

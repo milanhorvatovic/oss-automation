@@ -29,9 +29,11 @@ Before pushing:
 ```bash
 ruff check src tests .github/scripts
 ruff format --check src tests .github/scripts
-pytest
-pytest --pyargs oss_automation_guards
+pytest --cov --cov-report= --cov-fail-under=0
+pytest --pyargs oss_automation_guards --cov --cov-append
 ```
+
+Those last two are the CI commands: coverage accumulates across both suites and the combined total has to clear 90%, which is why the first pass defers the threshold rather than judging its own half. Plain `pytest` and `pytest --pyargs oss_automation_guards` remain the right thing to run while iterating.
 
 ### What the guards enforce
 

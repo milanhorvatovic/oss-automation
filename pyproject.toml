@@ -19,6 +19,7 @@ dependencies = [
 # the runtime dependencies above stay ranges because this is a library.
 [project.optional-dependencies]
 dev = [
+  "pytest-cov==7.1.0",
   "ruff==0.16.4",
 ]
 
@@ -30,6 +31,20 @@ packages = ["src/oss_automation_guards"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+
+# Measured by import name, not by path: CI installs the wheel rather than the
+# source tree, so the guards run from site-packages and a path source would
+# report every line of them missing.
+[tool.coverage.run]
+source = ["oss_automation_guards"]
+branch = true
+
+[tool.coverage.report]
+show_missing = true
+# Under the low nineties the two suites reach together, with room for a
+# change that lands slightly behind its tests rather than a ratchet failing
+# the pull request that adds a guard before the one that exercises it.
+fail_under = 90
 
 [tool.ruff]
 target-version = "py310"

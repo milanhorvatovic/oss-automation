@@ -47,7 +47,11 @@ jobs:
         run: |
           ruff check src tests .github/scripts
           ruff format --check src tests .github/scripts
+      # Coverage spans both suites, so the threshold is judged once, after
+      # the second: the guards exercise paths the unit tests never reach and
+      # the reverse, and a floor applied to either half alone would fail a
+      # change whose combined coverage is fine.
       - name: Run the unit tests
-        run: pytest
+        run: pytest --cov --cov-report= --cov-fail-under=0
       - name: Run the guards against this repository's workflow tree
-        run: pytest --pyargs oss_automation_guards
+        run: pytest --pyargs oss_automation_guards --cov --cov-append

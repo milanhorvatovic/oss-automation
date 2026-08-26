@@ -85,7 +85,7 @@ Every pull request needs the `gate` status check green and one approving review.
 
 ## Releasing
 
-Maintainer task, documented in the [README](README.md#releasing): dispatch the **Prepare Release** workflow with the version, review the pull request it opens, merge it, then push the `vX.Y.Z` tag. The changelog section is generated rather than written — add prose under `## [Unreleased]` only when a release needs explaining beyond its list of pull requests, and the prepare step carries it across. The release workflow verifies tag, manifest, and changelog agree before it publishes anything, so a mismatch fails the release rather than shipping one.
+Maintainer task, documented in the [README](README.md#releasing): dispatch the **Prepare Release** workflow with the version, review the pull request it opens, merge it, then sign and push the `vX.Y.Z` tag on that merge commit. The changelog section is generated rather than written — add prose under `## [Unreleased]` only when a release needs explaining beyond its list of pull requests, and the prepare step carries it across. The release workflow verifies tag, manifest, and changelog agree before it publishes anything, so a mismatch fails the release rather than shipping one.
 
 ## Contribution basis
 

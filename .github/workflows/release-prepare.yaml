@@ -170,7 +170,7 @@ jobs:
           \`\`\`
           git switch ${DEFAULT_BRANCH} && git pull
           MERGE_SHA=...   # the merge commit of this pull request
-          git tag v${VERSION} "\$MERGE_SHA"
+          git tag -s v${VERSION} "\$MERGE_SHA"
           git push origin v${VERSION}
           \`\`\`
 

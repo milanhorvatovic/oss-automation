@@ -46,6 +46,14 @@ def test_default_token_scopes_are_pinned(workflow_path: Path) -> None:
     _assert_clean(checks.unpinned_permissions(load_workflow(workflow_path)))
 
 
+def test_credentialed_jobs_never_check_out(workflow_path: Path) -> None:
+    _assert_clean(checks.credentialed_jobs_that_check_out(load_workflow(workflow_path)))
+
+
+def test_run_scripts_read_values_from_env(workflow_path: Path) -> None:
+    _assert_clean(checks.interpolated_run_scripts(load_workflow(workflow_path)))
+
+
 def test_pr_credentials_are_bound_to_the_trust_model(
     workflow_path: Path, pytestconfig: pytest.Config
 ) -> None:

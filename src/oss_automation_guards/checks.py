@@ -51,6 +51,11 @@ _REPOSITORY = "github.repository"
 _ACTOR = "github.actor"
 _GITHUB_CONTEXT = "github"
 _DEFAULT_TOKEN = "github_token"
+# Named absolutely rather than keyed on a `ref:` that resolves to the pull
+# request's head: on pull_request the default ref is already the merge commit,
+# and on pull_request_target a base checkout is one edit away from a head one.
+# "A credentialed job does not check out" is the rule a reader can hold.
+_CHECKOUT_ACTION = "actions/checkout"
 
 
 def jobs_missing_timeout(workflow: WorkflowFile) -> list[str]:
@@ -126,16 +131,7 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
     if not pr_triggers:
         return []
     findings = []
-    # A secret in the workflow-level env reaches the steps of every runner
-    # job, so those are credentialed whether or not they name it. A job that
-    # calls a reusable workflow has no steps of its own and the callee does
-    # not inherit the caller's env, so it is credentialed only by what it
-    # passes down.
-    workflow_credentialed = _references_secret(workflow.data.get("env"))
-    for job_id, job in workflow.jobs.items():
-        inherits_env = workflow_credentialed and "uses" not in job
-        if not (inherits_env or _holds_credentials(job, workflow)):
-            continue
+    for job_id, job in _credentialed_pr_jobs(workflow):
         raw_condition = job.get("if")
         # An unparseable condition proves nothing, so it pins nothing: the
         # guard reports both pins missing rather than assume the best.
@@ -169,6 +165,71 @@ def unguarded_pr_credentials(workflow: WorkflowFile) -> list[str]:
                 f" trust on the event actor rather than on {_AUTHOR_PIN}"
             )
     return findings
+
+
+def credentialed_jobs_that_check_out(workflow: WorkflowFile) -> list[str]:
+    pr_triggers = sorted(set(workflow.triggers) & _PR_TRIGGERS)
+    if not pr_triggers:
+        return []
+    triggers = "/".join(pr_triggers)
+    findings = []
+    for job_id, job in _credentialed_pr_jobs(workflow):
+        for index, step in _steps(job):
+            uses = step.get("uses")
+            if isinstance(uses, str) and _names_action(uses, _CHECKOUT_ACTION):
+                findings.append(
+                    f"job '{job_id}' step {index} checks out while holding credentials on"
+                    f" a {triggers} trigger; keep credentialed jobs checkout-free so no"
+                    " tree a pull request can steer shares a runner with them"
+                )
+    return findings
+
+
+def interpolated_run_scripts(workflow: WorkflowFile) -> list[str]:
+    findings = []
+    for job_id, job in workflow.jobs.items():
+        for index, step in _steps(job):
+            script = step.get("run")
+            if not isinstance(script, str):
+                continue
+            for body in expression_bodies(script):
+                expression = "${{" + body + "}}"
+                findings.append(
+                    f"job '{job_id}' step {index} interpolates {expression} into its `run:`"
+                    " script; the value is pasted into the shell before it runs, so one"
+                    " carrying shell syntax executes — bind it to an `env:` variable and"
+                    " read that instead"
+                )
+    return findings
+
+
+def _credentialed_pr_jobs(workflow: WorkflowFile) -> list[tuple[str, dict[str, Any]]]:
+    """Jobs a credential reaches, for a workflow carrying a pull-request trigger."""
+    # A secret in the workflow-level env reaches the steps of every runner
+    # job, so those are credentialed whether or not they name it. A job that
+    # calls a reusable workflow has no steps of its own and the callee does
+    # not inherit the caller's env, so it is credentialed only by what it
+    # passes down.
+    workflow_credentialed = _references_secret(workflow.data.get("env"))
+    return [
+        (job_id, job)
+        for job_id, job in workflow.jobs.items()
+        if (workflow_credentialed and "uses" not in job) or _holds_credentials(job, workflow)
+    ]
+
+
+def _steps(job: dict[str, Any]) -> list[tuple[int, dict[str, Any]]]:
+    """Step mappings with their 1-based position, which non-mappings still occupy."""
+    steps = job.get("steps")
+    if not isinstance(steps, list):
+        return []
+    return [(index, step) for index, step in enumerate(steps, start=1) if isinstance(step, dict)]
+
+
+def _names_action(uses: str, action: str) -> bool:
+    if uses.startswith(("./", "docker://")):
+        return False
+    return uses.partition("@")[0].strip().lower() == action
 
 
 def _uses_targets(workflow: WorkflowFile) -> list[tuple[str, str, int]]:

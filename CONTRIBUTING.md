@@ -41,8 +41,10 @@ Any workflow file you add or edit must satisfy the structural rules, or CI fails
 - Every third-party action is pinned to an immutable revision, with a trailing comment naming the pinned version (`# v7.0.1`): a full 40-character commit SHA for a repository action, or a `sha256:` image digest for a `docker://` one. A comment that merely contains a digit does not satisfy this.
 - Every job is covered by an explicit `permissions:` block at the workflow or the job level. Inheriting the repository's default fails the guard even when that default is read-only: the scopes have to be stated where a reader of the file can see them.
 - A PR-triggered workflow that holds credentials is bound to its declared trust model.
+- A credentialed job on a pull-request trigger never checks out. The rule is absolute rather than keyed on a `ref:` naming the pull request's head: on `pull_request` the default ref is already the merge commit, and on `pull_request_target` a base checkout is one edit away from a head one.
+- A `run:` script never interpolates `${{ … }}`. The expression is substituted into the shell before the script runs, so a value carrying shell syntax executes; bind it to an `env:` variable and read that instead. This one has no exemption, because the indirection costs nothing anywhere.
 
-The last one is the rule most likely to surprise you. A workflow that gains a `secrets:` reference or a write scope becomes credentialed in the guards' eyes and must carry the matching trust guards; if a file is a deliberate exception, declare it through the `guards_trust_exempt` pytest ini option rather than weakening the guard.
+The trust-model rule is the one most likely to surprise you. A workflow that gains a `secrets:` reference or a write scope becomes credentialed in the guards' eyes and must carry the matching trust guards; if a file is a deliberate exception, declare it through the `guards_trust_exempt` pytest ini option rather than weakening the guard.
 
 ### Changing a reusable workflow's contract
 

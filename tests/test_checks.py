@@ -1345,3 +1345,185 @@ class TestTrustModel:
             """
         )
         assert len(checks.unguarded_pr_credentials(parsed)) == 2
+
+
+class TestCheckoutFreeCredentials:
+    def test_non_pr_workflow_may_check_out_with_credentials(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              workflow_dispatch:
+            jobs:
+              prepare:
+                steps:
+                  - uses: actions/checkout@{SHA}
+                    with:
+                      token: ${{{{ secrets.APP_TOKEN }}}}
+            """
+        )
+        assert checks.credentialed_jobs_that_check_out(parsed) == []
+
+    def test_uncredentialed_pr_job_may_check_out(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            permissions:
+              contents: read
+            jobs:
+              test:
+                steps:
+                  - uses: actions/checkout@{SHA}
+            """
+        )
+        assert checks.credentialed_jobs_that_check_out(parsed) == []
+
+    def test_credentialed_pr_job_that_checks_out_is_found(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request_target:
+            jobs:
+              policy:
+                if: >-
+                  {TRUSTED_IF}
+                steps:
+                  - uses: actions/checkout@{SHA}
+                  - run: mint
+                    env:
+                      KEY: ${{{{ secrets.AUTOMATION_PRIVATE_KEY }}}}
+            """
+        )
+        findings = checks.credentialed_jobs_that_check_out(parsed)
+        assert len(findings) == 1
+        assert "step 1" in findings[0]
+        assert "pull_request_target" in findings[0]
+
+    def test_checkout_is_matched_whatever_its_case(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request_target:
+            jobs:
+              policy:
+                permissions:
+                  contents: write
+                steps:
+                  - uses: Actions/Checkout@{SHA}
+            """
+        )
+        assert checks.credentialed_jobs_that_check_out(parsed) != []
+
+    def test_a_local_action_is_not_read_as_the_checkout_action(self) -> None:
+        parsed = workflow(
+            """
+            on:
+              pull_request_target:
+            jobs:
+              policy:
+                permissions:
+                  contents: write
+                steps:
+                  - uses: ./.github/actions/checkout
+            """
+        )
+        assert checks.credentialed_jobs_that_check_out(parsed) == []
+
+    def test_workflow_level_env_secret_credentials_the_checkout(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request:
+            env:
+              TOKEN: ${{{{ secrets.DEPLOY_TOKEN }}}}
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA}
+            """
+        )
+        assert checks.credentialed_jobs_that_check_out(parsed) != []
+
+    def test_step_numbering_counts_every_entry(self) -> None:
+        parsed = workflow(
+            f"""
+            on:
+              pull_request_target:
+            jobs:
+              policy:
+                permissions:
+                  contents: write
+                steps:
+                  - run: first
+                  - run: second
+                  - uses: actions/checkout@{SHA}
+            """
+        )
+        findings = checks.credentialed_jobs_that_check_out(parsed)
+        assert len(findings) == 1
+        assert "step 3" in findings[0]
+
+
+class TestRunInterpolation:
+    def test_a_value_read_from_env_passes(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                steps:
+                  - run: echo "$TITLE"
+                    env:
+                      TITLE: ${{ github.event.pull_request.title }}
+            """
+        )
+        assert checks.interpolated_run_scripts(parsed) == []
+
+    def test_an_expression_in_the_script_is_found(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                steps:
+                  - run: echo "${{ github.event.pull_request.title }}"
+            """
+        )
+        findings = checks.interpolated_run_scripts(parsed)
+        assert len(findings) == 1
+        assert "${{ github.event.pull_request.title }}" in findings[0]
+
+    def test_every_expression_in_one_script_is_reported(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                steps:
+                  - run: |
+                      echo "${{ github.ref }}"
+                      echo "${{ github.sha }}"
+            """
+        )
+        assert len(checks.interpolated_run_scripts(parsed)) == 2
+
+    def test_a_job_condition_is_not_a_run_script(self) -> None:
+        parsed = workflow(
+            """
+            jobs:
+              build:
+                if: ${{ github.ref == 'refs/heads/main' }}
+                steps:
+                  - run: echo hello
+            """
+        )
+        assert checks.interpolated_run_scripts(parsed) == []
+
+    def test_a_step_without_a_script_is_skipped(self) -> None:
+        parsed = workflow(
+            f"""
+            jobs:
+              build:
+                steps:
+                  - uses: actions/checkout@{SHA}
+                  - run:
+            """
+        )
+        assert checks.interpolated_run_scripts(parsed) == []

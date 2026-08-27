@@ -1,0 +1,53 @@
+name: Verify
+
+# The one definition of "this repository passes", called by the pull-request
+# gate and by the release gate alike.
+#
+# Kept as a reusable workflow rather than a composite action for two reasons.
+# A composite action can only hold the command steps — the matrix, the
+# checkout and the interpreter setup would stay duplicated in both callers,
+# which is most of what there was to share. And `.github/actions` is outside
+# the tree discover_workflows() walks, so every pin and permission moved there
+# would leave the guards' sight; this repository grades its own workflow tree,
+# and shrinking that tree to tidy a file is the wrong trade.
+#
+# No ref input: a called workflow runs in the caller's context, so a plain
+# checkout resolves the pull request's merge commit under test.yaml and the
+# pushed tag under release.yaml without either caller saying so.
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    strategy:
+      fail-fast: false
+      matrix:
+        # The oldest supported floor and the current release.
+        python-version: ["3.10", "3.14"]
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          # Nothing here touches git, so the default persisted credential
+          # would only sit in .git/config for the suite to read.
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install the test-pack
+        run: python -m pip install '.[dev]'
+      - name: Lint
+        run: |
+          ruff check src tests .github/scripts
+          ruff format --check src tests .github/scripts
+      - name: Run the unit tests
+        run: pytest
+      - name: Run the guards against this repository's workflow tree
+        run: pytest --pyargs oss_automation_guards

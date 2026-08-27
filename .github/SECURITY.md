@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-No tagged release exists yet, so nothing here is supported for production use. Once `v0.1.0` ships, the latest tag is the supported line; older tags receive fixes only when a consumer is demonstrably pinned to one.
+The latest tag is the supported line. Older tags receive fixes only when a consumer is demonstrably pinned to one.
 
 Consumers call these workflows at a full 40-character commit SHA rather than a tag, so a fix reaches you when the pin moves — Dependabot's `github-actions` ecosystem raises that bump like any other.
 

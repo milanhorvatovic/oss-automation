@@ -70,6 +70,15 @@ There is no PR template; descriptions in this repository follow a consistent sha
 - **Test plan** — the commands you ran and their results, plus what you did _not_ exercise. "Not exercised: no run has executed with credentials" is a useful line; an invented test result is not.
 - **Notes** — consequences a reviewer would otherwise have to discover: contract changes, behaviour that got quieter or louder, deliberate trade-offs.
 
+Label the pull request before it merges. `.github/release.yml` sorts the generated release notes by label, and those notes are what `release-prepare.yaml` writes into the changelog — so an unlabelled pull request lands under **Other changes** however consequential it was:
+
+- **`contract-change`** — changes an input, secret, output, or required permission of a reusable workflow, or changes a guard in a way that can turn a previously green consumer tree red. These lead the notes, because a consumer has to read them before moving a pin.
+- **`security`** — a fix or a hardening a consumer should apply promptly.
+- **`enhancement`**, **`bug`**, **`documentation`** — the ordinary cases.
+- **`chore`** — repo upkeep with no consumer-visible effect: tooling, CI, lint config, an interface reshaped before it was ever released.
+
+`dependencies` is applied by Dependabot itself.
+
 Every pull request needs the `gate` status check green and one approving review. Merges are squash-only, and the branch is deleted afterwards. Copilot reviews each push automatically; its findings are advisory, and disagreeing with one in the thread is a normal outcome.
 
 ## Releasing

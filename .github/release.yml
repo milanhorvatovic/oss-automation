@@ -1,0 +1,50 @@
+# Categories for GitHub's generated release notes
+# (POST /releases/generate-notes).
+#
+# Read twice per release, not once: release-prepare.yaml calls that endpoint
+# and writes the result into the CHANGELOG section, where
+# write_changelog_section.py demotes each category heading to '####' beneath
+# its own '### Merged pull requests'; release-tag.yaml then publishes that
+# section. Without this file every pull request lands in one flat list.
+#
+# A pull request is filed under the first category whose labels it carries, so
+# the order below is the precedence: what a consumer must read before moving a
+# pin comes before what they may skip.
+changelog:
+  categories:
+    # The two headings RELEASE_NOTES_TEMPLATE.md requires a release to call
+    # out. Both depend on a label a human applies, and an unlabelled pull
+    # request lands under Other changes however contract-breaking it was —
+    # so CONTRIBUTING.md makes labelling part of opening a pull request
+    # rather than a step somebody remembers at release time. An empty
+    # category renders as nothing, so a release that needs neither heading
+    # simply does not grow one.
+    - title: Caller-contract changes
+      labels:
+        - contract-change
+    - title: Security
+      labels:
+        - security
+    - title: Added
+      labels:
+        - enhancement
+    - title: Fixed
+      labels:
+        - bug
+    - title: Documentation
+      labels:
+        - documentation
+    # Applied by Dependabot itself, so this category fills without anyone
+    # remembering to label a bump.
+    - title: Dependencies
+      labels:
+        - dependencies
+    # Last before the catch-all rather than unlabelled, so repo upkeep is
+    # visible without sitting among changes a consumer acts on. Everything
+    # below Dependencies is "you may stop reading here".
+    - title: Chores
+      labels:
+        - chore
+    - title: Other changes
+      labels:
+        - "*"

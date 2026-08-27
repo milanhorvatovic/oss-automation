@@ -61,7 +61,20 @@ name: Dependabot Policy
 # gate's context required, plus stale-review dismissal on push so an
 # approval pinned to a verified head cannot outlive it. Changing the kill-switch variable emits no PR
 # event, so a flip takes effect per PR on that PR's next event; the
-# reconciler workflow's cron is the bounded-latency sweep across open PRs.
+# reconciler workflow's cron sweep is where it lands for every PR that has
+# no next event, on GitHub's best-effort schedule rather than inside any
+# interval a cron can promise.
+#
+# Every run ends by annotating what it decided: the derived tier, the live
+# veto and tamper-check states behind it, and whether auto-merge was armed
+# and the update approved. Those last two are confirmed state, written by
+# the step that observed it — a step's own outcome answers whether it ran,
+# never whether it armed or approved, and both steps have paths that exit
+# zero having done neither. The exception a reader has to know about is an
+# event whose payload already carries a veto label: the job-level guard reads
+# those labels, so no tier is derived and disarm-on-veto annotates that hold
+# instead. A veto added after the event was emitted does not skip anything —
+# that run is already admitted and reports the label from its live check.
 #
 # Fleet-fixed conventions, deliberately not inputs: the
 # DEPENDABOT_AUTOMERGE_ENABLED kill-switch variable, the trust-boundary and
@@ -443,6 +456,7 @@ jobs:
       # normalized to squash when it posts — otherwise the worker merges
       # with the stale method the moment the approval lands.
       - name: Arm squash auto-merge
+        id: arm
         if: >-
           steps.live-veto.outputs.veto == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
@@ -483,6 +497,7 @@ jobs:
             fi
             if [[ "$method" == "SQUASH" ]]; then
               echo "Squash auto-merge is armed."
+              echo "armed=true" >> "$GITHUB_OUTPUT"
               exit 0
             fi
             if [[ "$attempt" -eq 6 ]]; then
@@ -507,6 +522,7 @@ jobs:
       # preserve that pattern when extending. Runs after the arm step so
       # the merge this approval may complete is the verified squash one.
       - name: Approve eligible update
+        id: approve
         if: >-
           steps.live-veto.outputs.veto == 'false' && steps.effective.outputs.update-type != 'version-update:semver-major' && steps.privileged.outputs.privileged-hit == 'false' && steps.authorship.outputs.dependabot-only == 'true' && vars.DEPENDABOT_AUTOMERGE_ENABLED == 'true'
         env:
@@ -532,6 +548,7 @@ jobs:
           fi
           if [[ "$decision" == "APPROVED" ]]; then
             echo "The PR is already approved; not posting another review."
+            echo "approved=true" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           # The tamper check ran on a recorded head; a commit appended since
@@ -551,6 +568,68 @@ jobs:
             echo "::warning::Failed to post the approval review; the PR stays armed for a manual approval."
             exit 0
           fi
+          echo "approved=true" >> "$GITHUB_OUTPUT"
+
+      # The tier drives every decision above but only ever reached a step
+      # output, so a maintainer facing a held update had to infer which gate
+      # held it from which steps happened to run.
+      #
+      # Reports what the arm and approve steps confirmed, not their exit
+      # status. A step's outcome answers whether it ran, and both have paths
+      # that exit zero having armed and approved nothing — a late veto, a
+      # head that moved, a pull request already merged, and every guarded
+      # call the approve step warns its way out of. Each writes its output
+      # on the path that observed the state, so the output is the only
+      # honest source. Neither is re-derived from the conditions the steps
+      # run under: a second copy of those expressions would be free to drift
+      # from the ones that executed.
+      #
+      # Runs on always() so a failed gate above still reports the state it
+      # reached. An event whose payload already carries a veto never reaches
+      # this step — the job-level guard reads those labels and skips the whole
+      # job, so disarm-on-veto reports that gate. A veto added after the event
+      # was emitted is the other case: this run is already admitted, the live
+      # check above sees the label, and the veto field below carries it.
+      - name: Report the derived tier
+        if: always()
+        env:
+          UPDATE_TYPE: ${{ steps.effective.outputs.update-type }}
+          PRIVILEGED: ${{ steps.privileged.outputs.privileged-hit }}
+          DEPENDABOT_ONLY: ${{ steps.authorship.outputs.dependabot-only }}
+          VETO: ${{ steps.live-veto.outputs.veto }}
+          ARM_OUTCOME: ${{ steps.arm.outcome }}
+          ARMED: ${{ steps.arm.outputs.armed }}
+          APPROVE_OUTCOME: ${{ steps.approve.outcome }}
+          APPROVED: ${{ steps.approve.outputs.approved }}
+        run: |
+          set -euo pipefail
+          case "${UPDATE_TYPE:-}" in
+            version-update:semver-major) tier="major" ;;
+            version-update:semver-minor) tier="minor" ;;
+            version-update:semver-patch) tier="patch" ;;
+            *) tier="undetermined" ;;
+          esac
+          case "${PRIVILEGED:-}" in
+            true) tier="${tier}, privileged" ;;
+            false) ;;
+            # The privileged match never produced an output — the step failed
+            # or never ran, and always() brought us here anyway. Saying
+            # "minor" alone would present an undetermined gate as a cleared one.
+            *) tier="${tier}, privileged match undetermined" ;;
+          esac
+          describe() {
+            local outcome="$1" achieved="$2" done_word="$3"
+            if [[ "$achieved" == "true" ]]; then
+              echo "$done_word"
+            elif [[ "$outcome" == "skipped" || -z "$outcome" ]]; then
+              echo "not attempted"
+            else
+              echo "attempted but not ${done_word}"
+            fi
+          }
+          arm=$(describe "${ARM_OUTCOME:-}" "${ARMED:-}" "armed")
+          approve=$(describe "${APPROVE_OUTCOME:-}" "${APPROVED:-}" "approved")
+          echo "::notice::Derived tier: ${tier}. Live veto label: ${VETO:-undetermined}; commit tamper check passed: ${DEPENDABOT_ONLY:-undetermined} (authorship, committer, signature and a complete commit enumeration). Auto-merge: ${arm}; approval: ${approve}."
 
   disarm-on-veto:
     # Fires on any event whose current payload carries a veto label — the
@@ -594,6 +673,7 @@ jobs:
       # lifted must not be the final writer that disarms a re-armed PR.
       # A failed label query keeps the hold and proceeds with the disarm.
       - name: Disable auto-merge
+        id: disarm
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
           PR_URL: ${{ github.event.pull_request.html_url }}
@@ -605,15 +685,48 @@ jobs:
           fi
           if [[ "$live_veto" != "true" ]]; then
             echo "The veto label is no longer present; leaving auto-merge as it is."
+            echo "hold=lifted" >> "$GITHUB_OUTPUT"
             exit 0
           fi
           gh pr merge --disable-auto "$PR_URL" 2>&1 || true
-          # `--jq` renders a JSON null scalar as an empty string, so query a
-          # boolean instead of comparing the raw value against "null". Only a
-          # literal "false" passes; anything else fails closed.
-          armed=$(gh pr view "$PR_URL" --json autoMergeRequest --jq '.autoMergeRequest != null')
-          if [[ "$armed" != "false" ]]; then
+          # A merged PR reads autoMergeRequest null just as a disarmed one
+          # does, so state has to disambiguate: only an unmerged, unarmed PR
+          # confirms the hold landed, and MERGED means the prohibited merge
+          # won the race. The same check the reconciler's veto path makes,
+          # and what keeps the hold=enforced output below honest.
+          if ! verify=$(gh pr view "$PR_URL" --json state,autoMergeRequest); then
+            echo "::error::Failed to verify the veto disarm."
+            exit 1
+          fi
+          if [[ "$(jq -r '.state' <<<"$verify")" == "MERGED" ]]; then
+            echo "::error::The PR merged while the veto disarm was in flight; the hold did not land. Investigate immediately."
+            exit 1
+          fi
+          # `.autoMergeRequest != null` renders a boolean rather than an empty
+          # string for a JSON null. Only a literal "false" passes; anything
+          # else fails closed.
+          if [[ "$(jq -r '.autoMergeRequest != null' <<<"$verify")" != "false" ]]; then
             echo "::error::Auto-merge is still enabled after applying a veto label. The PR may merge despite the hold; investigate immediately."
             exit 1
           fi
           echo "Auto-merge is disabled for the veto-label hold."
+          echo "hold=enforced" >> "$GITHUB_OUTPUT"
+
+      # ...and this reports it, on always() for the same reason the policy
+      # job's report does: a mint or a disarm that fails is exactly when a
+      # maintainer needs to be told which gate they are looking at. Reading
+      # the disarm step's own output keeps the three states apart — a hold
+      # enforced, a label lifted before this run reached it, and a run that
+      # got neither far enough to say.
+      - name: Report the veto hold
+        if: always()
+        env:
+          HOLD: ${{ steps.disarm.outputs.hold }}
+        run: |
+          set -euo pipefail
+          case "${HOLD:-}" in
+            enforced) lead="Held by a veto label: auto-merge is disarmed and the update is held" ;;
+            lifted) lead="The veto label was gone by the time this run read it, so auto-merge was left as it was" ;;
+            *) lead="A veto-labelled event ran but this run could not confirm the hold — check the step above" ;;
+          esac
+          echo "::notice::${lead}. The policy job is skipped for an event whose payload already carries a veto label, so this event derived no tier; the next event on a pull request carrying none is the one that reports it."

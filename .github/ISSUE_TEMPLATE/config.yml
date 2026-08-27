@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Report a vulnerability
+    url: https://github.com/milanhorvatovic/oss-automation/security/advisories/new
+    about: >-
+      Policy bypasses, credentials meeting pull-request code, and guards that
+      pass a tree they should fail go through a private advisory, never a
+      public issue. SECURITY.md lists what is in scope.

@@ -1,0 +1,40 @@
+name: Proposal
+description: A new guard, a new reusable workflow, or a change to an existing contract.
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        A guard that passes a tree it should fail is a false negative, and
+        SECURITY.md counts that as a vulnerability — open a private advisory
+        rather than naming the tree here. This form is for a gap no guard
+        claims to cover yet.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What goes wrong today
+      description: >-
+        The failure this prevents, not the feature. A guard earns its place by
+        naming a tree it would have failed.
+    validations:
+      required: true
+  - type: textarea
+    id: shape
+    attributes:
+      label: What you have in mind
+    validations:
+      required: true
+  - type: dropdown
+    id: contract
+    attributes:
+      label: Does this change a caller contract?
+      description: >-
+        Inputs, secrets, outputs, required permissions, or a guard that can
+        turn a green consumer tree red.
+      options:
+        - "No"
+        - "Yes — consumers would have to change something"
+        - Not sure
+    validations:
+      required: true

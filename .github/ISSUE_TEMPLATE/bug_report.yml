@@ -1,0 +1,48 @@
+name: Bug report
+description: A workflow or a guard behaved differently from its documented contract.
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: >-
+        A pull request reaching merge when the policy says it should be held,
+        or a guard passing a tree it should fail, is a security report — close
+        this and open a private advisory instead. SECURITY.md draws the line.
+  - type: dropdown
+    id: artifact
+    attributes:
+      label: Which artifact
+      options:
+        - dependabot-policy
+        - dependabot-reconciler
+        - release-tag
+        - release-please
+        - oss-automation-guards (the pytest test-pack)
+    validations:
+      required: true
+  - type: input
+    id: revision
+    attributes:
+      label: Pinned revision
+      description: The commit SHA you call the workflow at, or install the test-pack from.
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: What the contract says should happen
+      description: >-
+        Quote the line from the workflow header, the README, or CONTRIBUTING
+        that you read it from.
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: What happened instead
+      description: >-
+        Run URLs are worth more than a description. For a guard, the failing
+        assertion and the workflow file it names.
+    validations:
+      required: true

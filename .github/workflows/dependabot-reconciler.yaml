@@ -11,6 +11,12 @@ name: Dependabot Reconciler
 #     schedule:
 #       - cron: "*/30 * * * *"
 #     workflow_dispatch:
+#
+# The cron is a recovery cadence, not a deadline: GitHub runs scheduled
+# workflows on a best-effort basis and delays or drops them under load, so
+# nothing here — the kill switch included — may be described to a consumer
+# as taking effect within the interval. workflow_dispatch is the lever when
+# a specific flip has to land now.
 #   concurrency:
 #     group: dependabot-reconciler
 #     cancel-in-progress: false
@@ -207,8 +213,8 @@ jobs:
     steps:
       # Same sentinel as policy's: distinguishes "deliberately disabled"
       # from "the variable not resolving in the caller". With the switch
-      # off the sweep still runs — it is the bounded-latency path that
-      # revokes stale approvals and arms across open PRs after a flip.
+      # off the sweep still runs — it is the recovery path that revokes
+      # stale approvals and arms across open PRs after a flip.
       - name: Report auto-merge switch state
         env:
           ENABLED: ${{ vars.DEPENDABOT_AUTOMERGE_ENABLED }}
@@ -404,7 +410,7 @@ jobs:
           echo "Auto-merge confirmed disabled under the live veto."
 
       # The kill-switch flip emits no PR event; this sweep is where an
-      # off-flip lands with bounded latency. Same semantics as policy's
+      # off-flip lands. Same semantics as policy's
       # revocation: dismiss the App's approvals, disarm the App-armed
       # auto-merge, leave a maintainer's arm alone, and treat an
       # unconfirmed revocation as a hard error. Vetoed PRs are NOT

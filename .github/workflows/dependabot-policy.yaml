@@ -61,7 +61,9 @@ name: Dependabot Policy
 # gate's context required, plus stale-review dismissal on push so an
 # approval pinned to a verified head cannot outlive it. Changing the kill-switch variable emits no PR
 # event, so a flip takes effect per PR on that PR's next event; the
-# reconciler workflow's cron is the bounded-latency sweep across open PRs.
+# reconciler workflow's cron sweep is where it lands for every PR that has
+# no next event, on GitHub's best-effort schedule rather than inside any
+# interval a cron can promise.
 #
 # Every run ends by annotating what it decided: the derived tier, the live
 # veto and tamper-check states behind it, and whether auto-merge was armed

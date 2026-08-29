@@ -1,0 +1,15 @@
+# What builds and describes a release artifact, as opposed to what checks the
+# code: pyproject's `dev` extra carries the linter, the type checker and the
+# test plugins, and none of those touch a byte that gets published.
+#
+# These live here rather than in an extra because the compiled requirements-
+# release.txt beside them pins the transitive closure by hash, which an extra
+# cannot express — and this tooling produces the bytes a release attests, so a
+# newly published indirect dependency would otherwise reach them unreviewed.
+#
+# Regenerate with:
+#   uv pip compile requirements-release.in --universal --python-version 3.10 \
+#     --generate-hashes -o requirements-release.txt
+build==1.6.0
+cyclonedx-bom==7.3.1
+hatchling==1.32.0

@@ -47,6 +47,11 @@ jobs:
         run: |
           ruff check src tests .github/scripts
           ruff format --check src tests .github/scripts
+      # Scoped to src by [tool.mypy]: py.typed ships inside the wheel, so the
+      # annotations a consumer's type checker reads are the ones under check
+      # here.
+      - name: Type-check
+        run: mypy
       # Coverage spans both suites, so the threshold is judged once, after
       # the second: the guards exercise paths the unit tests never reach and
       # the reverse, and a floor applied to either half alone would fail a
@@ -55,3 +60,22 @@ jobs:
         run: pytest --cov --cov-report= --cov-fail-under=0
       - name: Run the guards against this repository's workflow tree
         run: pytest --pyargs oss_automation_guards --cov --cov-append
+      # The sdist ships the suite, and the suite reads a file outside src/, so
+      # pyproject's include list is load-bearing and nothing else notices when
+      # it stops covering what the tests open: the wheel is unaffected and a
+      # broken sdist surfaces only when someone unpacks a published release.
+      # The install into a fresh environment is what makes this a check on the
+      # artifact — run against the environment built from the checkout, the
+      # tests import the package that was installed there, and dropping /src
+      # from the include list would leave this green. Coverage is already gated
+      # above; this pass deliberately does not append to it.
+      - name: Run the shipped suite from an sdist
+        run: |
+          set -euo pipefail
+          python -m pip install --quiet --require-hashes -r requirements-release.txt
+          python -m build --no-isolation --sdist --outdir "${RUNNER_TEMP}/sdist" .
+          tar xzf "${RUNNER_TEMP}"/sdist/*.tar.gz -C "${RUNNER_TEMP}/sdist"
+          python -m venv "${RUNNER_TEMP}/sdist-env"
+          cd "${RUNNER_TEMP}/sdist"/oss_automation_guards-*/
+          "${RUNNER_TEMP}/sdist-env/bin/pip" install --disable-pip-version-check --quiet .
+          "${RUNNER_TEMP}/sdist-env/bin/pytest" -q

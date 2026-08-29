@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import cache
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 
 import yaml
 
@@ -18,7 +18,9 @@ class WorkflowLoadError(Exception):
 class WorkflowFile:
     path: Path
     text: str
-    data: dict[str, Any]
+    # Keyed by Any rather than str because the Norway problem below puts the
+    # trigger block under the boolean True in most of these files.
+    data: dict[Any, Any]
 
     @classmethod
     def from_text(cls, text: str, path: Path = Path("workflow.yaml")) -> WorkflowFile:
@@ -44,7 +46,7 @@ class WorkflowFile:
             return {raw: None}
         if isinstance(raw, list):
             return {name: None for name in raw}
-        return raw
+        return cast("dict[str, Any]", raw)
 
     @property
     def jobs(self) -> dict[str, dict[str, Any]]:

@@ -45,6 +45,16 @@ git push origin vX.Y.Z
 
 `-s` is worth the keystroke: the tag is what a consumer resolves a pin from, and a signed one carries a Verified badge on the release page once GitHub can check the signature — the public half of the key has to be on your account first. The release workflow does not require it.
 
+Each release also carries the built wheel and sdist, a CycloneDX SBOM naming that wheel and the closure it resolved to at release time, and `SHA256SUMS` — with a provenance attestation over all four, so the metadata you read is verifiable and not just the code you install. Verify one before you trust a download:
+
+```bash
+gh attestation verify oss_automation_guards-X.Y.Z-py3-none-any.whl \
+  --repo milanhorvatovic/oss-automation \
+  --signer-workflow milanhorvatovic/oss-automation/.github/workflows/release.yaml
+```
+
+`--repo` alone would accept an attestation minted by any workflow in this repository; `--signer-workflow` is what ties the artifact to the release path that is supposed to have built it.
+
 ## Contributing
 
 [CONTRIBUTING.md](CONTRIBUTING.md) covers setup, the structural rules a change has to satisfy, and the shape of a commit and a pull request here. [AGENTS.md](AGENTS.md) adds what an agent contributor gets wrong. Participation is under the [Code of Conduct](CODE_OF_CONDUCT.md).

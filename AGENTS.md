@@ -14,6 +14,10 @@
 
 `[project] version` in `pyproject.toml` and the `## [X.Y.Z]` section of `CHANGELOG.md` are written by the **Prepare Release** workflow, which exists because the release refuses to publish unless the tag, the manifest and that section agree. Add prose under `## [Unreleased]`; leave the rest alone.
 
+## The verify matrix names required checks
+
+`verify.yaml`'s `python-version` matrix decides the status contexts the default branch's ruleset requires: `verify / test (3.10)` and `verify / test (3.14)`. Rename a leg and its context is renamed with it, leaving every open pull request waiting on a check that will never report — the ruleset is a repository setting, so no commit can fix it. Treat a matrix edit as a ruleset change first: have the required-checks list updated in the same sitting, or replace the two contexts with a single always-run aggregator job before touching the matrix at all.
+
 ## A workflow header is part of the change
 
 Every reusable workflow states its trust model in a comment block above its `on:` key, and consumers set their repositories up from it. A change to behaviour that leaves the header describing the old behaviour is worse than no header: it hands a consumer two incompatible instructions from one file. Update both in the same change.

@@ -107,7 +107,7 @@ def expression_bodies(text: str) -> list[str]:
     literal — `format('{0} }}', secrets.TOKEN)` — does not end the
     expression, and treating it as the end would hide everything after it.
     """
-    bodies = []
+    bodies: list[str] = []
     index = 0
     while True:
         start = text.find("${{", index)
@@ -333,7 +333,7 @@ class _Parser:
                 return arguments
             self._expect_operator(",")
 
-    def _read_segment(self) -> str | None:
+    def _read_segment(self) -> str:
         kind, value = self._next()
         if kind == "name" or (kind == "operator" and value == "*"):
             return str(value)

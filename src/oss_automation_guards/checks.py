@@ -267,7 +267,10 @@ def _uses_targets(workflow: WorkflowFile) -> list[tuple[str, str, int]]:
 def _mapping_entry(node: yaml.Node | None, key: str) -> yaml.Node | None:
     if not isinstance(node, yaml.MappingNode):
         return None
-    for key_node, value_node in node.value:
+    # The stubs leave MappingNode.value untyped; a mapping node holds the
+    # (key, value) node pairs its entries were parsed from.
+    pairs: list[tuple[yaml.Node, yaml.Node]] = node.value
+    for key_node, value_node in pairs:
         if isinstance(key_node, yaml.ScalarNode) and key_node.value == key:
             return value_node
     return None

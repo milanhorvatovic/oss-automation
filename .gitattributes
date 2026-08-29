@@ -1,0 +1,4 @@
+# Workflow YAML and shell run steps are read by Linux runners; a CRLF
+# checkout on a contributor's machine would commit line endings the runner
+# then has to tolerate.
+* text=auto eol=lf

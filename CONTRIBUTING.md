@@ -65,7 +65,7 @@ Bodies are optional but usual here, written as flowing paragraphs (one paragraph
 
 ## Pull requests
 
-There is no PR template; descriptions in this repository follow a consistent shape, and matching it helps review:
+[`.github/PULL_REQUEST_TEMPLATE.md`](.github/PULL_REQUEST_TEMPLATE.md) prefills the shape descriptions here follow. It carries the headings and a short prompt under each; what each one owes a reviewer is this:
 
 - **Summary** — what changes and, more importantly, why this is the right change.
 - **Changes** — per-file or per-area, naming the reasoning behind anything non-obvious.

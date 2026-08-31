@@ -13,7 +13,16 @@ Reusable GitHub Actions workflows and structural guard tests powering automation
 
 ## Using it
 
-Consumers call the workflows at a full 40-character commit SHA and let Dependabot bump the pin — a `uses:` reference is code that runs against the caller's token, so a tag someone can move is not good enough. The test-pack is a development dependency rather than a workflow reference, so a release tag selects a version fine; pin it to a commit as well if you want that same guarantee for the code grading your tree. Run it from the consumer repository's root:
+Consumers call the workflows at a full 40-character commit SHA and let Dependabot bump the pin — a `uses:` reference is code that runs against the caller's token, so a tag someone can move is not good enough. The guards are the exception, and they come two ways. As a step, which is the shorter one:
+
+```yaml
+- uses: actions/checkout@<40-char-sha>                       # v7.0.1
+- uses: milanhorvatovic/oss-automation/guards@<40-char-sha>  # vX.Y.Z
+```
+
+It installs the test-pack from the revision you pinned, into an environment of its own, and runs it against `.github/workflows` — `workflow-tree` points it elsewhere, and `python-version` sets up an interpreter if you want one other than the runner's. The repository's root is deliberately not an action: it holds several things, so a sub-action names which one you mean, and addressing the root fails with a message saying so.
+
+Or as a development dependency, which is what a project already running pytest usually wants:
 
 ```bash
 pip install "oss-automation-guards @ git+https://github.com/milanhorvatovic/oss-automation@vX.Y.Z"
@@ -21,6 +30,8 @@ pytest --pyargs oss_automation_guards
 ```
 
 Point it at another tree with `--workflow-tree`, and declare a deliberate trust-model exemption per workflow file with the `guards_trust_exempt` pytest ini option.
+
+The reusable workflows have no such short form, and that is a property of GitHub rather than a rough edge here: a reusable workflow is addressed as `{owner}/{repo}/.github/workflows/{file}@{ref}` and lives nowhere else. It is also the right shape for them — an action runs inside your job, under your token, so it could not hold the properties these workflows exist for: a credentialed job that checks out nothing, a publishing job that shares no runner with the code that built the artifact.
 
 The Dependabot workflows need more than a `uses:` line — a GitHub App, an Actions secret, two repository variables, two labels, and a default-branch ruleset that lets an armed pull request actually merge. The release workflows need none of that: `release-tag` uses no App, and `release-please` takes the credentials only so its release pull request triggers your CI, falling back to the default token without them — a fallback that needs *Allow GitHub Actions to create and approve pull requests* enabled in the repository's Actions settings. **[docs/consumers.md](docs/consumers.md)** walks through all of it, with copy-paste callers.
 

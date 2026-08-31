@@ -80,48 +80,10 @@ jobs:
         with:
           persist-credentials: false
 
+      # The build itself is a sub-action, so this repository's own pull
+      # requests exercise it — it used to run for the first time at a tag.
       - name: Build the distributables and their SBOM
-        env:
-          # A second environment holding only the built wheel, so the SBOM
-          # lists what a consumer installing it gets rather than what the
-          # build needed. Created --without-pip and populated from the tools
-          # environment, because a seeded pip is a component the SBOM would
-          # otherwise report as part of this package's closure.
-          RUNTIME_ENV: ${{ runner.temp }}/runtime
-          TOOLS_ENV: ${{ runner.temp }}/tools
-          # Names the SBOM after what it describes, like every other asset
-          # here. release-tag has already refused to publish unless this tag
-          # and the manifest version match, so the two spellings agree.
-          TAG: ${{ needs.release.outputs.tag-name || github.ref_name }}
-        run: |
-          set -euo pipefail
-          python3 -m venv "$TOOLS_ENV"
-          # The lock, and not the project: `pip install .` would build this
-          # package first, in a PEP 517 environment resolved from the unbounded
-          # [build-system] requires — an unreviewed backend executing in the
-          # very environment the reviewed one was supposed to guarantee. The
-          # tools do not need the package installed to build it.
-          "${TOOLS_ENV}/bin/pip" install --disable-pip-version-check --quiet \
-            --require-hashes -r requirements-release.txt
-          # --no-isolation: build in the environment just installed, so the
-          # backend executing here is the locked one rather than whatever an
-          # isolated build would resolve [build-system] requires to.
-          "${TOOLS_ENV}/bin/python" -m build --no-isolation --outdir dist .
-          python3 -m venv --without-pip "$RUNTIME_ENV"
-          "${TOOLS_ENV}/bin/pip" --python "${RUNTIME_ENV}/bin/python" install --disable-pip-version-check --quiet dist/*.whl
-          # --pyproject names the wheel as the document's root component;
-          # metadata.component is null without it, which is the field most
-          # tools read to learn what an SBOM is about. It also drops the
-          # component's build-path reference, whose file:// URL named this
-          # runner's temporary directory — so --output-reproducible now
-          # describes the output rather than aspiring to. The cost is the
-          # wheel's own SHA-256, which the SBOM carried in that same
-          # reference; SHA256SUMS and the attestation both still cover it.
-          "${TOOLS_ENV}/bin/cyclonedx-py" environment "$RUNTIME_ENV" \
-            --pyproject pyproject.toml --mc-type library \
-            --output-reproducible \
-            --output-file "dist/oss_automation_guards-${TAG#v}.cdx.json"
-          cd dist && sha256sum -- *.whl *.tar.gz *.cdx.json > SHA256SUMS
+        uses: ./python-dist
 
       - name: Hand the release assets to the credentialed job
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1

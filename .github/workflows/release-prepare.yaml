@@ -102,7 +102,7 @@ jobs:
             exit 1
           fi
 
-      - name: Generate the changelog section and bump the manifest
+      - name: Generate the release notes for this range
         id: notes
         env:
           GH_TOKEN: ${{ steps.bot-token.outputs.token }}
@@ -132,11 +132,16 @@ jobs:
             args+=(-f previous_tag_name="$previous")
           fi
           gh api -X POST "repos/${GH_REPO}/releases/generate-notes" "${args[@]}" --jq '.body' > "${RUNNER_TEMP}/generated-notes.md"
-          python3 .github/scripts/write_changelog_section.py \
-            --version "$VERSION" \
-            --date "$(date -u +%Y-%m-%d)" \
-            --notes "${RUNNER_TEMP}/generated-notes.md" \
-            --repo "$GH_REPO"
+          printf 'release-date=%s\n' "$(date -u +%Y-%m-%d)" >> "$GITHUB_OUTPUT"
+
+      # Through the sub-action rather than the script directly, so the surface
+      # a consumer calls is the one this repository's own release exercises.
+      - name: Promote the Unreleased section
+        uses: ./changelog-section
+        with:
+          version: ${{ inputs.version }}
+          date: ${{ steps.notes.outputs.release-date }}
+          notes: ${{ runner.temp }}/generated-notes.md
 
       - name: Open the release pull request
         env:

@@ -114,6 +114,101 @@ jobs:
             echo "::error::the root manifest reported '${OUTCOME}'; it is supposed to fail and name the sub-actions."
             exit 1
           fi
+  # The release build, run on every pull request. It used to execute for the
+  # first time at a tag — the one place a mistake costs a version number that
+  # the tag ruleset will not let anyone reclaim.
+  dist:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the distributables and their SBOM
+        id: dist
+        uses: ./python-dist
+
+      - name: Check it produced what a release publishes
+        env:
+          SBOM_PATH: ${{ steps.dist.outputs.sbom-path }}
+        run: |
+          set -euo pipefail
+          ls -1 dist
+          test -f "$SBOM_PATH"
+          # Counted, not just listed: every other check here passes with extra
+          # wheels, sdists or SBOMs beside the expected ones, and "what a
+          # release publishes" is a claim about the whole directory.
+          files=$(find dist -maxdepth 1 -type f | wc -l | tr -d ' ')
+          if [[ "$files" != "4" ]]; then
+            echo "::error::expected 4 files in dist, found ${files}."
+            find dist -maxdepth 1 -type f
+            exit 1
+          fi
+          ( cd dist && sha256sum -c SHA256SUMS )
+          # The SBOM has to name what it describes; metadata.component is null
+          # without --pyproject, and that is the field most tools read.
+          python3 -c "
+          import json, os, sys
+          d = json.load(open(os.environ['SBOM_PATH']))
+          root = d['metadata']['component']
+          print('root:', root['type'], root['name'], root['version'])
+          assert root['name'] == 'oss-automation-guards', root
+          assert all(c.get('purl') for c in d['components']), 'a component has no purl'
+          "
+
+
+  # The changelog wrapper, run against a disposable checkout. Its script has
+  # unit tests; the action around it had nothing until now, since the only
+  # caller is a workflow_dispatch nobody runs on a pull request — so a broken
+  # input name or a wrong path would have surfaced during a release.
+  changelog:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Stand in for what GitHub's generator would produce
+        shell: bash
+        run: |
+          set -euo pipefail
+          printf '## What'"'"'s Changed\n* Something by @nobody in #1\n' > "${RUNNER_TEMP}/notes.md"
+
+      - name: Promote a section through the action
+        uses: ./changelog-section
+        with:
+          version: "9.9.9"
+          date: "2026-01-01"
+          notes: ${{ runner.temp }}/notes.md
+
+      - name: Check it rewrote both files the release depends on
+        shell: bash
+        env:
+          # The link references are built from the repository input, whose
+          # default is what this job is covering; a prefix match would pass
+          # with that default empty and the URL reading github.com//releases.
+          REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # release-tag refuses to publish unless the tag, the manifest and a
+          # '## [X.Y.Z]' section agree, so these are the three things the
+          # action exists to keep in step.
+          grep -q '^## \[9\.9\.9\] - 2026-01-01$' CHANGELOG.md
+          grep -q '^version = "9.9.9"$' pyproject.toml
+          grep -q "^\[9\.9\.9\]: https://github.com/${REPO}/releases/tag/v9\.9\.9$" CHANGELOG.md
+          # And the heading it promoted from has to survive for the next one,
+          # with its comparison link rebased onto the version just cut.
+          grep -q '^## \[Unreleased\]$' CHANGELOG.md
+          grep -q "^\[Unreleased\]: https://github.com/${REPO}/compare/v9\.9\.9\.\.\.HEAD$" CHANGELOG.md
+          echo "changelog and manifest agree on 9.9.9"
 
   # The isolation the action advertises, run against a checkout built to
   # break it. Every other leg uses this repository's own benign configuration,
@@ -181,7 +276,7 @@ jobs:
   # AGENTS.md warns about, since renaming a matrix leg would no longer rename
   # a required context.
   verified:
-    needs: [verify, action, isolation]
+    needs: [verify, action, isolation, dist, changelog]
     if: always()
     runs-on: ubuntu-latest
     timeout-minutes: 5
@@ -190,7 +285,7 @@ jobs:
     steps:
       - name: Fail unless every job above succeeded
         env:
-          RESULTS: ${{ needs.verify.result }} ${{ needs.action.result }} ${{ needs.isolation.result }}
+          RESULTS: ${{ needs.verify.result }} ${{ needs.action.result }} ${{ needs.isolation.result }} ${{ needs.dist.result }} ${{ needs.changelog.result }}
         run: |
           set -euo pipefail
           for result in $RESULTS; do

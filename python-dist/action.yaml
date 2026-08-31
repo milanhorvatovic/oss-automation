@@ -1,0 +1,151 @@
+name: Build a Python distribution and describe it
+description: >-
+  Build a wheel and an sdist from a hash-locked toolchain, generate a
+  CycloneDX SBOM of what installing the wheel pulls in, and write SHA256SUMS
+  over all three. Linux runners only.
+
+# One of this repository's step-shaped internals, lifted out of release.yaml so
+# a caller can have the same artifacts without adopting the release flow around
+# them — and so this repository's own pull requests exercise the build that
+# used to run for the first time at a tag.
+#
+# It holds no credentials and needs none: it reads a manifest and writes files.
+# What it deliberately does not do is publish, attest, or upload; those need
+# scopes, and a step that needs scopes belongs in a job that declares them.
+#
+# Linux runners. Two separate reasons, and they are not the same on every
+# platform: Windows lays a virtual environment out under `Scripts/` rather than
+# `bin/`, and macOS — whose layout is `bin/` like Linux — ships `shasum` rather
+# than `sha256sum`.
+# That is a documented contract rather than an oversight: release builds run on
+# Linux in practice, and a portability claim needs a build matrix behind it
+# before it is worth making. `runs-on: ubuntu-latest`, or say so in an issue.
+
+inputs:
+  requirements:
+    description: >-
+      Hash-locked requirements file holding the build frontend, the backend and
+      the SBOM generator. Installed with --require-hashes, so every transitive
+      needs a hash: an unpinned closure resolves fresh on every build, and the
+      bytes it produces are the ones a release attests.
+    required: false
+    default: requirements-release.txt
+  outdir:
+    description: Directory the artifacts are written to.
+    required: false
+    default: dist
+  sbom-name:
+    description: >-
+      File name for the SBOM, without a directory. Left empty, it is named for
+      the distribution and version the build produced, like every other file
+      beside it. `SHA256SUMS` and anything ending in `.whl` or `.tar.gz` are
+      rejected: the first is the checksum file written in the same directory,
+      and the others would be collected as distributables.
+    required: false
+    default: ""
+
+outputs:
+  sbom-path:
+    description: Path of the SBOM that was written.
+    value: ${{ steps.build.outputs.sbom-path }}
+
+runs:
+  using: composite
+  steps:
+    - name: Build the distributables and their SBOM
+      id: build
+      shell: bash
+      env:
+        OUTDIR: ${{ inputs.outdir }}
+        REQUIREMENTS: ${{ inputs.requirements }}
+        RUNTIME_ENV: ${{ runner.temp }}/oss-automation-dist-runtime
+        SBOM_NAME: ${{ inputs.sbom-name }}
+        TOOLS_ENV: ${{ runner.temp }}/oss-automation-dist-tools
+      run: |
+        set -euo pipefail
+        # Validated before anything is removed, not merely before the SBOM is
+        # written: the cleanup below deletes this name inside the output
+        # directory, so a path escaping it would be a deletion outside the
+        # directory this action was pointed at — checking afterwards would be
+        # checking after the damage.
+        #
+        # A supplied name shares a directory with the artifacts and the
+        # checksum file, and the shell truncates a redirection target before
+        # the command writing it runs — so `sbom-name: SHA256SUMS` destroys
+        # the SBOM and leaves a manifest whose last line hashes itself, with
+        # nothing failing. A name ending in .whl or .tar.gz is the quieter
+        # version: it lands in the globs and is published as a distributable.
+        case "$SBOM_NAME" in
+          */*)
+            echo "::error::sbom-name is a file name, not a path: '${SBOM_NAME}' contains a directory component."
+            exit 1 ;;
+          SHA256SUMS)
+            echo "::error::sbom-name 'SHA256SUMS' is the checksum file this step writes; the redirection would truncate the SBOM."
+            exit 1 ;;
+          *.whl | *.tar.gz)
+            echo "::error::sbom-name '${SBOM_NAME}' would be collected as a distributable by the checksum and upload globs."
+            exit 1 ;;
+        esac
+        # Removed first: venv does not clear an existing directory, and these
+        # paths are fixed per job. A second invocation would otherwise build
+        # its SBOM from an environment still holding the first one's wheel.
+        rm -rf "$TOOLS_ENV" "$RUNTIME_ENV"
+        python3 -m venv "$TOOLS_ENV"
+        # The lock, and not the project: `pip install .` would build the
+        # package first, in a PEP 517 environment resolved from an unbounded
+        # [build-system] requires — an unreviewed backend executing in the very
+        # environment the reviewed one was supposed to guarantee. The tools do
+        # not need the package installed in order to build it.
+        "${TOOLS_ENV}/bin/pip" install --disable-pip-version-check --quiet \
+          --require-hashes -r "$REQUIREMENTS"
+        # `build --outdir` adds to a directory rather than owning it, so a
+        # second invocation after a version bump leaves the older wheel and
+        # sdist in place — and the globs below would then install both, hash
+        # both, and describe a closure that is not this build's. The four
+        # names this action writes are cleared first; anything else a caller
+        # keeps in that directory is left alone.
+        # ${SBOM_NAME:-} as well as the glob: a caller who supplied a name
+        # not ending in .cdx.json would otherwise keep the previous run's SBOM,
+        # and the upload that follows publishes whatever is in this directory.
+        # What this cannot clean is a name it was never given — change
+        # sbom-name between builds into one directory and the earlier file is
+        # yours to remove, since the action has no way to learn it existed.
+        rm -f "$OUTDIR"/*.whl "$OUTDIR"/*.tar.gz "$OUTDIR"/*.cdx.json \
+          "$OUTDIR"/SHA256SUMS ${SBOM_NAME:+"$OUTDIR/$SBOM_NAME"}
+        # --no-isolation: build in the environment just installed, so the
+        # backend executing here is the locked one rather than whatever an
+        # isolated build would resolve [build-system] requires to.
+        "${TOOLS_ENV}/bin/python" -m build --no-isolation --outdir "$OUTDIR" .
+        # A second environment holding only the built wheel, so the SBOM lists
+        # what a consumer installing it gets rather than what the build needed.
+        # Created --without-pip and populated from the tools environment,
+        # because a seeded pip is a component the SBOM would otherwise report
+        # as part of this package's closure.
+        python3 -m venv --without-pip "$RUNTIME_ENV"
+        "${TOOLS_ENV}/bin/pip" --python "${RUNTIME_ENV}/bin/python" \
+          install --disable-pip-version-check --quiet "$OUTDIR"/*.whl
+        if [[ -z "$SBOM_NAME" ]]; then
+          # Named for what it describes, from the wheel that was just built
+          # rather than from a tag this action never sees. A wheel filename is
+          # {distribution}-{version}(-{build})?-{python}-{abi}-{platform}.whl
+          # and the distribution escapes its own hyphens, so the first two
+          # fields are the name and the version whatever the tags say — a
+          # platform wheel has no more right to be misnamed than a pure one.
+          wheel=$(basename "$OUTDIR"/*.whl)
+          SBOM_NAME="$(cut -d- -f1,2 <<<"$wheel").cdx.json"
+        fi
+        # --pyproject names the distribution as the document's root component;
+        # metadata.component is null without it, which is the field most tools
+        # read to learn what an SBOM is about. It also drops the component's
+        # build-path reference, whose file:// URL named this runner's temporary
+        # directory — so --output-reproducible describes the output rather than
+        # aspiring to.
+        "${TOOLS_ENV}/bin/cyclonedx-py" environment "$RUNTIME_ENV" \
+          --pyproject pyproject.toml --mc-type library \
+          --output-reproducible \
+          --output-file "${OUTDIR}/${SBOM_NAME}"
+        # The SBOM is hashed by the name it was actually written under: the
+        # sbom-name input takes any filename, and a glob for *.cdx.json would
+        # both miss it and fail the whole command on the unmatched pattern.
+        ( cd "$OUTDIR" && sha256sum -- *.whl *.tar.gz "$SBOM_NAME" > SHA256SUMS )
+        printf 'sbom-path=%s\n' "${OUTDIR}/${SBOM_NAME}" >> "$GITHUB_OUTPUT"

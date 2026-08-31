@@ -1,0 +1,105 @@
+name: Promote a changelog's Unreleased section
+description: >-
+  Turn `## [Unreleased]` into a dated `## [X.Y.Z]` section, carrying any prose
+  already written there across above the generated list, and bump the version
+  in pyproject.toml so the two agree.
+
+# The other step-shaped internal, lifted out of release-prepare.yaml. It writes
+# two files and touches nothing else — no token, no network beyond the notes
+# file the caller hands it, nothing to isolate.
+#
+# The implementation stays a single script at .github/scripts, which this
+# action invokes and which release-prepare.yaml reaches through this action
+# rather than calling itself. One copy, one caller shape, so the unit tests in
+# tests/test_changelog_section.py grade what a consumer runs.
+#
+# It assumes what this repository's own release assumes: a Keep a Changelog
+# file with an `## [Unreleased]` heading, and a pyproject.toml carrying exactly
+# one `version = "…"` line. A project shaped differently wants its own step,
+# not an input on this one.
+
+inputs:
+  version:
+    description: Version being released, without a leading v.
+    required: true
+  date:
+    description: >-
+      Date for the new section, as YYYY-MM-DD. Required rather than defaulted
+      to "today": a release cut either side of midnight UTC should carry the
+      date its caller decided on, not the one the runner happened to observe.
+    required: true
+  notes:
+    description: >-
+      File holding the generated release notes to place under the section. The
+      caller produces it — GitHub's own generator is what release-prepare.yaml
+      uses — so this action neither calls an API nor needs a token.
+    required: true
+  repository:
+    description: Repository the changelog's link references point at.
+    required: false
+    default: ${{ github.repository }}
+
+runs:
+  using: composite
+  steps:
+    - name: Rewrite the changelog and the manifest
+      shell: bash
+      env:
+        ACTION_PATH: ${{ github.action_path }}
+        NOTES: ${{ inputs.notes }}
+        RELEASE_DATE: ${{ inputs.date }}
+        REPOSITORY: ${{ inputs.repository }}
+        VERSION: ${{ inputs.version }}
+      run: |
+        set -euo pipefail
+        # `required: true` in the metadata above is documentation: GitHub does
+        # not enforce it, and an omitted input arrives as an empty string. Left
+        # unchecked, that writes `version = ""` into the manifest and a `## []`
+        # heading into the changelog, and the release workflow's parity check
+        # is where a maintainer would find out.
+        # repository is included: its default only applies when the input is
+        # omitted, so an explicit empty value reaches the script and writes
+        # link references reading https://github.com//releases/... — valid
+        # markdown pointing nowhere, in a file consumers navigate by.
+        for pair in "version:${VERSION}" "date:${RELEASE_DATE}" "notes:${NOTES}" "repository:${REPOSITORY}"; do
+          if [[ -z "${pair#*:}" ]]; then
+            echo "::error::input '${pair%%:*}' is required and arrived empty."
+            exit 1
+          fi
+        done
+        if [[ ! -f "$NOTES" ]]; then
+          echo "::error::notes file '${NOTES}' does not exist; this action reads it, it does not generate it."
+          exit 1
+        fi
+        # release-prepare.yaml checks this before dispatching, but a direct
+        # caller does not pass through it, and the value lands in two places
+        # that have to agree with a tag: `[project] version` and a `## [X.Y.Z]`
+        # heading. The same expression that workflow uses, for the same reason
+        # it gives — a leading v would travel into the manifest and fail at
+        # publish time, where the parity check is a worse place to learn it.
+        if [[ ! "$VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+((a|b|rc)[0-9]+)?(\.post[0-9]+)?(\.dev[0-9]+)?$ ]]; then
+          echo "::error::version '${VERSION}' is not a PEP 440 release version; pass it without a leading v (e.g. 0.1.1, 0.2.0rc1)."
+          exit 1
+        fi
+        # The date goes verbatim into a heading a consumer reads and a release
+        # is dated by, so it is checked for shape and for being a real day —
+        # `2026-99-99` is neither, and nothing downstream would object to it.
+        python3 - <<'PY'
+        import datetime, os, sys
+        value = os.environ["RELEASE_DATE"]
+        try:
+            parsed = datetime.date.fromisoformat(value)
+        except ValueError:
+            sys.exit(f"::error::date '{value}' is not a calendar date in YYYY-MM-DD form.")
+        # fromisoformat accepts spellings this contract does not, so the
+        # round trip is what pins the format rather than the parse.
+        if parsed.isoformat() != value:
+            sys.exit(f"::error::date '{value}' must be written as {parsed.isoformat()}.")
+        PY
+        # The script ships beside this action in the same checkout, so the
+        # implementation a consumer runs is the revision they pinned.
+        python3 "${ACTION_PATH}/../.github/scripts/write_changelog_section.py" \
+          --version "$VERSION" \
+          --date "$RELEASE_DATE" \
+          --notes "$NOTES" \
+          --repo "$REPOSITORY"

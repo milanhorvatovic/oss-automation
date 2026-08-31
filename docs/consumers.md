@@ -154,10 +154,74 @@ The `permissions:` block is required verbatim: a called workflow can only downgr
 
 Two flavors; pick by your commit convention.
 
-- **`release-tag.yaml`** — you push `vX.Y.Z`, your own jobs verify the tagged commit, and this workflow checks that the tag and the changelog's `## [X.Y.Z]` section agree before publishing. Manifest parity is the half you have to ask for: `version-command` defaults to an empty string, which skips the check, so a consumer that never sets it can publish a tag its manifest disagrees with. It runs no tests of its own: the project owns its suite.
+- **`release-tag.yaml`** — you push `vX.Y.Z`, your own jobs verify the tagged commit, and this workflow checks that the tag and the changelog's `## [X.Y.Z]` section agree before publishing. Manifest parity is the half you have to ask for: `version-command` defaults to an empty string, which skips the check, so a consumer that never sets it can publish a tag its manifest disagrees with. It runs no tests of its own: the project owns its suite. If you attach assets to the release, set `draft: true` and publish it yourself once they are on it — see below.
 - **`release-please.yaml`** — a bot-maintained release pull request accumulates the version bump and changelog. Requires your commits, or your squash titles, to follow Conventional Commits.
 
-Each is called from a job you gate on your own verification, and that job's `permissions:` block is required verbatim for the same reason the reconciler caller's is — a called workflow can only downgrade the caller's token, never raise it. The two contracts differ. `release-tag.yaml` needs `contents: write`, and documents its inputs — `changelog-path`, `version-command`, `append-generated-notes`, `prerelease` — in its header. `release-please.yaml` needs `contents: write`, `issues: write` and `pull-requests: write`: the issues scope is not spare, since release-please tracks its own release pull request by label and labelling goes through the issues API. Its calling job also owns `concurrency: {group: release-please, cancel-in-progress: false}` — two default-branch merges seconds apart otherwise start two runs reconciling the same release pull request, and the loser leaves a stale body behind. The App credentials stay optional for it, but the default-token fallback carries a repository prerequisite of its own: **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests** has to be on, or `GITHUB_TOKEN` cannot open the release pull request at all and the job fails before release-please writes anything. Passing the App credentials avoids that setting and is also what makes the release pull request trigger your other workflows.
+Each is called from a job you gate on your own verification, and that job's `permissions:` block is required verbatim for the same reason the reconciler caller's is — a called workflow can only downgrade the caller's token, never raise it. The two contracts differ. `release-tag.yaml` needs `contents: write`, and documents its inputs — `changelog-path`, `version-command`, `append-generated-notes`, `draft`, `prerelease` — in its header. `release-please.yaml` needs `contents: write`, `issues: write` and `pull-requests: write`: the issues scope is not spare, since release-please tracks its own release pull request by label and labelling goes through the issues API. Its calling job also owns `concurrency: {group: release-please, cancel-in-progress: false}` — two default-branch merges seconds apart otherwise start two runs reconciling the same release pull request, and the loser leaves a stale body behind. The App credentials stay optional for it, but the default-token fallback carries a repository prerequisite of its own: **Settings → Actions → General → Workflow permissions → Allow GitHub Actions to create and approve pull requests** has to be on, or `GITHUB_TOKEN` cannot open the release pull request at all and the job fails before release-please writes anything. Passing the App credentials avoids that setting and is also what makes the release pull request trigger your other workflows.
+
+### Attaching assets to a release
+
+`release.published` carries whatever is attached at the moment it fires, and no second event follows an upload, so a release published before its assets exist announces an empty one — permanently — to everything that reads it. If you attach anything — built artifacts, checksums, an SBOM — take the draft path: the workflow creates the release unpublished, you fill it, and you publish last.
+
+Keep the build in a job of its own, separate from the one that uploads and publishes. The build runs code you did not write — a build backend, a packaging tool, whatever those resolve to — and a step running that code owns every later step in its own job, so it has no business sharing a runner with the token that can write. Three jobs, then: the `release` call, the build, and the publish.
+
+```yaml
+jobs:
+  release:
+    needs: verify
+    permissions:
+      contents: write
+    uses: milanhorvatovic/oss-automation/.github/workflows/release-tag.yaml@<40-char-sha>  # vX.Y.Z
+    with:
+      draft: true
+
+  build:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      # ... check out, build your artifacts into dist/ ...
+      - name: Hand them to the credentialed job
+        uses: actions/upload-artifact@<40-char-sha>  # vX.Y.Z
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - name: Collect what the build produced
+        uses: actions/download-artifact@<40-char-sha>  # vX.Y.Z
+        with:
+          name: release-assets
+          path: dist
+
+      - name: Upload them, then publish
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_ID: ${{ needs.release.outputs.release-id }}
+          TAG: ${{ needs.release.outputs.tag-name }}
+        run: |
+          set -euo pipefail
+          gh release upload "$TAG" dist/* --clobber
+          gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" -F draft=false --jq '.html_url'
+```
+
+The publishing job checks nothing out and runs nothing but those two actions and `gh`, so no code from the build shares a runner with its token. Every `uses:` carries a full 40-character SHA and a trailing `# vX.Y.Z` comment, which is what the guard pack requires of your tree as much as of this one.
+
+Address the release by `release-id`, not by `html-url` or by tag. A draft's URL is the `untagged-<hash>` placeholder captured when it was created, and a reusable workflow's outputs are fixed once its job ends, so that value never becomes the release's real address — the publish call returns it instead. `gh release` resolves releases by tag, which a draft is not attached to; `gh release upload` is the exception, and does find a draft by its tag name.
+
+**On the token.** GitHub does not start a workflow run from an event its own `GITHUB_TOKEN` caused. Publishing with it reaches everything that reads a release — the API, the releases page, a webhook a mirror or an external system is watching — but starts no `on: release` workflow in your repository, whether you publish at creation or after uploading. If those workflows are what you are publishing *for*, publish with an App installation token or a PAT: the publish step is yours, so it is a credential choice rather than a different caller shape. The App setup in [section 1](#1-the-automation-app) is the same one.
+
+The failure mode changes with this shape, and in your favour: a job that dies before publishing leaves a draft nobody can see, rather than a published release nobody can use. Nothing is announced until it is complete. The publish call is a PATCH and idempotent, so re-driving that job is safe; the creation is not, which is the other reason the two live in different jobs. `release.yaml` in this repository is the worked example.
 
 ## The guard pack
 

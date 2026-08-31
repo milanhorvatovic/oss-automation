@@ -14,13 +14,15 @@ name: Release
 # job therefore checks out nothing and runs nothing but the two actions it
 # needs.
 #
-# The artifacts job runs after the release exists rather than before it,
-# because that ordering matches which half is recoverable: creating a release
-# is not idempotent and the tag it names cannot be moved, while an asset
-# upload is a re-runnable `--clobber`. A failure there leaves a published
-# release missing its assets, and re-running *that job* uploads them. Re-running
-# the whole workflow does not: `release` would hit the 422 its own header
-# describes, and `artifacts` would be skipped behind the failure.
+# The release is drafted first, filled, and published last, so the
+# release.published event a consumer reacts to carries the assets rather than
+# announcing an empty release that no later event corrects. The ordering also
+# matches which half is recoverable: creating a release is not idempotent and
+# the tag it names cannot be moved, while an asset upload is a re-runnable
+# `--clobber` and publishing is a PATCH. A failure in the artifacts job leaves
+# an unpublished draft — invisible rather than wrong — and re-running *that*
+# job finishes it. Re-running the whole workflow does not: `release` would hit
+# the 422 its own header describes, and everything after it would be skipped.
 #
 # It sets up no Python. The runner image's interpreter builds a
 # `py3-none-any` wheel just as well, and `actions/setup-python` is absent from
@@ -59,6 +61,9 @@ jobs:
       # the same pull requests twice — and the second pass would also list the
       # release-preparation pull request, which merged after the first.
       append-generated-notes: false
+      # The assets are attached before this release is announced; the
+      # artifacts job below publishes it once they are on it.
+      draft: true
 
   # The distributables, built where nothing can write: this job holds no
   # credentials, so a compromised build backend or SBOM generator reaches no
@@ -174,3 +179,25 @@ jobs:
           # --clobber so a re-drive after a failed upload replaces what landed
           # rather than failing on the assets that already exist.
           gh release upload "$TAG" dist/* --clobber
+
+      - name: Publish the release now that it carries them
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # By id, not by tag: a draft's own URL is the untagged- placeholder
+          # captured at creation, and `gh release` addresses releases by tag,
+          # which a draft is not attached to.
+          #
+          # GITHUB_TOKEN is the right credential here even though an event it
+          # causes starts no workflow run: nothing in this repository listens
+          # on `on: release`, and what this publication is for — the release
+          # page, the API, a consumer's webhook — sees it either way. A
+          # repository that did listen would publish with its App instead.
+          RELEASE_ID: ${{ needs.release.outputs.release-id }}
+        run: |
+          set -euo pipefail
+          # Idempotent, unlike the creation: publishing an already-published
+          # release is a no-op PATCH, so re-driving this job is safe.
+          url=$(gh api -X PATCH "repos/${GH_REPO}/releases/${RELEASE_ID}" \
+            -F draft=false --jq '.html_url')
+          echo "Published: ${url}"

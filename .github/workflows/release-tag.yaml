@@ -12,6 +12,35 @@ name: Release Tag
 # and .dev1 alike — is published as a prerelease, so it never displaces the
 # current release as "Latest".
 #
+# A caller that attaches assets sets draft: true. Publishing is what emits
+# release.published, and that event carries whatever is attached at the moment
+# it fires — so a release published before its assets are uploaded announces an
+# empty one, and no second event follows the upload to correct it. In draft
+# mode this workflow creates the release unpublished and hands back its id; the
+# caller uploads, then publishes, and the event a consumer sees is the complete
+# release. The caller owns that final step, and a caller that never takes it
+# leaves a draft nobody can see rather than a release nobody can use.
+#
+# What the delay buys, precisely. GitHub does not start a workflow run from an
+# event its own GITHUB_TOKEN caused, so a caller publishing with that token
+# reaches everything that *reads* a release — the API, the releases page, the
+# webhook deliveries an external consumer or a mirror watches — but starts no
+# `on: release` workflow, before this change or after it. A caller that needs
+# those workflows to run publishes with an App or PAT instead; the publish step
+# is the caller's own, so that is a credential choice rather than a change to
+# this contract. release-prepare.yaml's header records the same rule from the
+# other side, which is why it mints an App token to open its pull request.
+#
+# Three consequences of a draft worth knowing before wiring one. Its html-url
+# is the `untagged-<hash>` placeholder captured at creation, and a reusable
+# workflow's outputs are fixed once its job ends — so that value does not
+# become the release's real URL when the caller publishes, and never will.
+# Address the release by release-id; the publish call returns the final URL.
+# And publishing a draft creates its tag if the tag is absent — this workflow
+# only ever runs from a pushed tag, so that cannot happen here, but a consumer
+# reusing the id elsewhere should know the call has that power, the more so
+# under a ruleset that makes v* tags permanent.
+#
 # Re-driving a failed publish is deliberate manual work: creating a release is
 # not idempotent, so a re-run after the release exists fails with 422
 # already_exists. Delete the release and re-run — the tag is already pushed,
@@ -47,6 +76,17 @@ on:
         required: false
         type: boolean
         default: true
+      draft:
+        description: >-
+          Create the release unpublished, for a caller that attaches assets.
+          The caller then publishes it — `gh api -X PATCH
+          repos/{owner}/{repo}/releases/<release-id> -F draft=false` — once the
+          uploads are done, so release.published fires with the assets already
+          attached rather than announcing an empty release. Left false, the
+          release is published immediately and any assets land after the event.
+        required: false
+        type: boolean
+        default: false
       prerelease:
         description: >-
           Whether the release is a prerelease, and so cannot become "Latest":
@@ -64,8 +104,16 @@ on:
         description: The tag the release was cut from, for a follow-on publish job.
         value: ${{ jobs.release.outputs.tag-name }}
       html-url:
-        description: Web URL of the published release.
+        description: >-
+          Web URL of the release. In draft mode this is the `untagged-<hash>`
+          placeholder as captured when the release was created: outputs are
+          fixed once this job ends, so publishing does not update it. Address
+          the release by release-id, and read the final URL from the response
+          to the publish call.
         value: ${{ jobs.release.outputs.html-url }}
+      release-id:
+        description: The release's API id, which a caller publishing a draft addresses it by.
+        value: ${{ jobs.release.outputs.release-id }}
 
 permissions:
   contents: read
@@ -153,6 +201,7 @@ jobs:
     outputs:
       tag-name: ${{ steps.publish.outputs.tag-name }}
       html-url: ${{ steps.publish.outputs.html-url }}
+      release-id: ${{ steps.publish.outputs.release-id }}
     steps:
       - name: Check out the tagged commit
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -169,6 +218,7 @@ jobs:
           TAG: ${{ github.ref_name }}
           CHANGELOG_PATH: ${{ inputs.changelog-path }}
           APPEND_GENERATED: ${{ inputs.append-generated-notes }}
+          DRAFT: ${{ inputs.draft }}
           PRERELEASE: ${{ inputs.prerelease }}
         run: |
           set -euo pipefail
@@ -249,18 +299,24 @@ jobs:
               found {print}
             ' "$CHANGELOG_PATH")
           fi
-          url=$(gh api "repos/${GH_REPO}/releases" \
+          # Two fields out of one call: the id a draft's publisher needs, and
+          # the URL, which for a draft is the untagged- placeholder the header
+          # describes rather than the release's eventual address.
+          read -r id url < <(gh api "repos/${GH_REPO}/releases" \
             -f tag_name="$TAG" \
             -f name="$TAG" \
             -f body="$notes" \
             -F generate_release_notes="$APPEND_GENERATED" \
+            -F draft="$DRAFT" \
             -F prerelease="$prerelease" \
-            --jq '.html_url')
+            --jq '"\(.id) \(.html_url)"')
           # The response no longer reaches the log now that stdout is
           # captured, and a successful release that names nothing is the wrong
           # log to land on when re-driving a 422.
-          echo "Published ${TAG} (prerelease=${prerelease}): ${url}"
+          state=$([[ "$DRAFT" == "true" ]] && echo "drafted" || echo "published")
+          echo "${state} ${TAG} (prerelease=${prerelease}, id=${id}): ${url}"
           {
             printf 'tag-name=%s\n' "$TAG"
             printf 'html-url=%s\n' "$url"
+            printf 'release-id=%s\n' "$id"
           } >> "$GITHUB_OUTPUT"

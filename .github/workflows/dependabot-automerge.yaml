@@ -83,19 +83,29 @@ jobs:
       # A compromised bump of any of these touches the fleet's trust root,
       # so their updates are armed but held for a maintainer — a malicious
       # tag must never ride its own policy to an auto-merged pin bump. What
-      # puts an entry here is the scope its revision executes under, not the
-      # file it sits in: the two workflow paths carry the policy these
+      # puts an entry here is what its revision can reach, not the file it
+      # sits in: the scope it executes under, or the bytes a release publishes
+      # and attests — a poisoned build backend ships a poisoned wheel with a
+      # valid attestation over it, which is worse than no attestation. The
+      # second half is why build, cyclonedx-bom and the two artifact actions
+      # are listed even though the build job holds no credentials. The two
+      # workflow paths carry the policy these
       # callers delegate to; create-github-app-token and fetch-metadata run
       # in jobs holding the App credentials; checkout runs in release-tag's
       # publishing job and release-please-action in release-please's, both
       # contents: write. Consumers call those two release workflows at a
       # SHA and execute these pins under their own write tokens, so a bump
-      # merged here runs everywhere. scorecard-action and codeql-action run
-      # only here rather than in a consumer's tree, but under id-token and
-      # security-events write, which is the same test. setup-python is
-      # deliberately absent — every job it runs in is contents: read with no
-      # secret in scope. Holding checkout also holds it for those read-only
-      # jobs, since Dependabot names the dependency, not the job.
+      # merged here runs everywhere. scorecard-action, codeql-action and
+      # attest-build-provenance run only here rather than in a consumer's
+      # tree, but under id-token, security-events and attestations write,
+      # which is the same test — and the last of those signs the statement a
+      # consumer verifies a release asset against, so an unreviewed revision
+      # of it is a revision of this repository's provenance claim.
+      # setup-python is deliberately absent — every job it runs in is
+      # contents: read with no secret in scope, which is why release.yaml's
+      # artifacts job builds on the runner's own interpreter rather than
+      # quietly falsifying that. Holding checkout also holds it for those
+      # read-only jobs, since Dependabot names the dependency, not the job.
       #
       # That hold is real on this trigger: the policy weighing the list is
       # the default branch's, not the one the bump carries. The fleet home
@@ -111,6 +121,12 @@ jobs:
         googleapis/release-please-action
         ossf/scorecard-action
         github/codeql-action
+        actions/attest-build-provenance
+        actions/download-artifact
+        actions/upload-artifact
+        build
+        cyclonedx-bom
+        hatchling
       automation-client-id: ${{ vars.AUTOMATION_CLIENT_ID }}
     secrets:
       automation-private-key: ${{ secrets.AUTOMATION_PRIVATE_KEY }}

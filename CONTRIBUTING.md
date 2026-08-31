@@ -4,7 +4,7 @@ This repository holds reusable GitHub Actions workflows other repositories call 
 
 ## Getting started
 
-Python 3.10 or newer.
+Python 3.10 or newer. `.python-version` names 3.14 — the newer of the two legs CI runs — so a version manager picks the interpreter this repository is developed against; 3.10 stays the supported floor and CI judges both.
 
 ```bash
 python -m venv .venv && source .venv/bin/activate
@@ -29,9 +29,12 @@ Before pushing:
 ```bash
 ruff check src tests .github/scripts
 ruff format --check src tests .github/scripts
+mypy
 pytest --cov --cov-report= --cov-fail-under=0
 pytest --pyargs oss_automation_guards --cov --cov-append
 ```
+
+`mypy` runs strict over `src` alone, because that is what `py.typed` promises a consumer's type checker.
 
 Those last two are the CI commands: coverage accumulates across both suites and the combined total has to clear 90%, which is why the first pass defers the threshold rather than judging its own half. Plain `pytest` and `pytest --pyargs oss_automation_guards` remain the right thing to run while iterating.
 

@@ -5,6 +5,27 @@ name: Release
 # release-please flavor is deliberately not used here — this repository's
 # commit convention is not Conventional Commits; it is offered to consumers
 # as a reusable workflow instead.
+#
+# Building and publishing are two jobs because the build runs third-party code
+# — a build backend, an SBOM generator, and whatever those resolve to — and
+# release-tag.yaml already states the rule this follows: a step running code
+# the repository did not write owns every later step in its own job, so the
+# token that can write releases never shares a runner with it. The credentialed
+# job therefore checks out nothing and runs nothing but the two actions it
+# needs.
+#
+# The artifacts job runs after the release exists rather than before it,
+# because that ordering matches which half is recoverable: creating a release
+# is not idempotent and the tag it names cannot be moved, while an asset
+# upload is a re-runnable `--clobber`. A failure there leaves a published
+# release missing its assets, and re-running *that job* uploads them. Re-running
+# the whole workflow does not: `release` would hit the 422 its own header
+# describes, and `artifacts` would be skipped behind the failure.
+#
+# It sets up no Python. The runner image's interpreter builds a
+# `py3-none-any` wheel just as well, and `actions/setup-python` is absent from
+# the privileged-dependency list on the grounds that every job it runs in is
+# `contents: read` with no secret in scope — a claim this job would falsify.
 
 on:
   push:
@@ -38,3 +59,118 @@ jobs:
       # the same pull requests twice — and the second pass would also list the
       # release-preparation pull request, which merged after the first.
       append-generated-notes: false
+
+  # The distributables, built where nothing can write: this job holds no
+  # credentials, so a compromised build backend or SBOM generator reaches no
+  # token. What it produces travels to the next job as an artifact.
+  build:
+    needs: release
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the tagged commit
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Build the distributables and their SBOM
+        env:
+          # A second environment holding only the built wheel, so the SBOM
+          # lists what a consumer installing it gets rather than what the
+          # build needed. Created --without-pip and populated from the tools
+          # environment, because a seeded pip is a component the SBOM would
+          # otherwise report as part of this package's closure.
+          RUNTIME_ENV: ${{ runner.temp }}/runtime
+          TOOLS_ENV: ${{ runner.temp }}/tools
+          # Names the SBOM after what it describes, like every other asset
+          # here. release-tag has already refused to publish unless this tag
+          # and the manifest version match, so the two spellings agree.
+          TAG: ${{ needs.release.outputs.tag-name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          python3 -m venv "$TOOLS_ENV"
+          # The lock, and not the project: `pip install .` would build this
+          # package first, in a PEP 517 environment resolved from the unbounded
+          # [build-system] requires — an unreviewed backend executing in the
+          # very environment the reviewed one was supposed to guarantee. The
+          # tools do not need the package installed to build it.
+          "${TOOLS_ENV}/bin/pip" install --disable-pip-version-check --quiet \
+            --require-hashes -r requirements-release.txt
+          # --no-isolation: build in the environment just installed, so the
+          # backend executing here is the locked one rather than whatever an
+          # isolated build would resolve [build-system] requires to.
+          "${TOOLS_ENV}/bin/python" -m build --no-isolation --outdir dist .
+          python3 -m venv --without-pip "$RUNTIME_ENV"
+          "${TOOLS_ENV}/bin/pip" --python "${RUNTIME_ENV}/bin/python" install --disable-pip-version-check --quiet dist/*.whl
+          # --pyproject names the wheel as the document's root component;
+          # metadata.component is null without it, which is the field most
+          # tools read to learn what an SBOM is about. It also drops the
+          # component's build-path reference, whose file:// URL named this
+          # runner's temporary directory — so --output-reproducible now
+          # describes the output rather than aspiring to. The cost is the
+          # wheel's own SHA-256, which the SBOM carried in that same
+          # reference; SHA256SUMS and the attestation both still cover it.
+          "${TOOLS_ENV}/bin/cyclonedx-py" environment "$RUNTIME_ENV" \
+            --pyproject pyproject.toml --mc-type library \
+            --output-reproducible \
+            --output-file "dist/oss_automation_guards-${TAG#v}.cdx.json"
+          cd dist && sha256sum -- *.whl *.tar.gz *.cdx.json > SHA256SUMS
+
+      - name: Hand the release assets to the credentialed job
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: release-assets
+          path: dist/
+          if-no-files-found: error
+
+  # Assets, and a provenance attestation binding them to this workflow run:
+  # consumers install from a git URL rather than from a release asset, so what
+  # these are for is verification — `gh attestation verify` answers "was this
+  # wheel built by that workflow, from that commit" without trusting the
+  # download.
+  artifacts:
+    needs: [release, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      # attestations: write records the attestation; id-token: write mints the
+      # Sigstore identity it is signed under; contents: write uploads assets to
+      # the release the previous job published.
+      attestations: write
+      contents: write
+      id-token: write
+    steps:
+      - name: Collect what the build produced
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: release-assets
+          path: dist
+
+      # Every asset, not just the two distributables: SHA256SUMS and the SBOM
+      # are the metadata a consumer reads to decide what they have, and an
+      # unattested checksum file downloaded from the same release cannot
+      # establish its own origin.
+      - name: Attest the build provenance
+        uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
+        with:
+          subject-path: dist/*
+
+      - name: Upload them to the release
+        env:
+          GH_REPO: ${{ github.repository }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # The tag the previous job reported publishing, rather than the ref
+          # this run started from: they agree, and reading the output is what
+          # makes the dependency on that job's success explicit. The fallback
+          # covers the one case where the output may not be there to read — a
+          # re-run of this job alone, where whether GitHub replays a non-re-run
+          # job's outputs is not something this file should have to assume.
+          # The two values cannot disagree: release-tag publishes github.ref_name.
+          TAG: ${{ needs.release.outputs.tag-name || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # --clobber so a re-drive after a failed upload replaces what landed
+          # rather than failing on the assets that already exist.
+          gh release upload "$TAG" dist/* --clobber

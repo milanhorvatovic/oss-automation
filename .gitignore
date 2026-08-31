@@ -1,6 +1,9 @@
 # macOS
 .DS_Store
 
+# Agent tooling
+.claude/
+
 # Python (testpack)
 __pycache__/
 *.py[cod]

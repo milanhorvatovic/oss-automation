@@ -29,9 +29,14 @@ dependencies = [
 # Exact pins so CI is reproducible and Dependabot's pip updates bump them;
 # the runtime dependencies above stay ranges because this is a library.
 [project.optional-dependencies]
+# What checks the code. What builds a release artifact lives in
+# requirements-release.txt instead, hash-locked: an extra cannot pin a
+# transitive closure, and that tooling produces bytes a release attests.
 dev = [
+  "mypy==2.3.1",
   "pytest-cov==7.1.0",
   "ruff==0.16.4",
+  "types-PyYAML==6.0.12.20260815",
 ]
 
 [project.urls]
@@ -44,6 +49,23 @@ oss_automation_guards = "oss_automation_guards.plugin"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/oss_automation_guards"]
+
+# Named rather than inferred. Hatchling's default sdist mirrors the working
+# tree minus .gitignore, so a file ignored only by .git/info/exclude — a
+# per-clone list no other machine carries — travels into a published artifact,
+# and what the sdist holds depends on whose checkout built it.
+[tool.hatch.build.targets.sdist]
+include = [
+  "/src",
+  "/tests",
+  # tests/test_changelog_section.py loads this script by path at import time,
+  # so an sdist carrying the suite without it collects zero tests and one
+  # FileNotFoundError.
+  "/.github/scripts",
+  "/CHANGELOG.md",
+  "/LICENSE",
+  "/README.md",
+]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
@@ -61,6 +83,12 @@ show_missing = true
 # change that lands slightly behind its tests rather than a ratchet failing
 # the pull request that adds a guard before the one that exercises it.
 fail_under = 90
+
+# The package ships py.typed, so its annotations are a promise to a consumer's
+# type checker. Strict is what makes that promise checked rather than nominal.
+[tool.mypy]
+files = ["src"]
+strict = true
 
 [tool.ruff]
 target-version = "py310"

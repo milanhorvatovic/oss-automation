@@ -22,3 +22,181 @@ permissions:
 jobs:
   verify:
     uses: ./.github/workflows/verify.yaml
+
+  # The action, run against this repository's own tree — the same dogfooding
+  # the guards themselves get from `verify`, one layer up. `verify` proves the
+  # test pack works when a consumer installs and invokes it; this proves the
+  # wrapper a consumer would rather use works too, and that its inputs and its
+  # bundled install path still resolve.
+  action:
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    strategy:
+      fail-fast: false
+      # Three legs for two claims the action makes and one it would otherwise
+      # only imply: that it runs where the runner's own interpreter is enough,
+      # that its optional python-version input sets one up, and that both the
+      # venv layouts it probes for are real. Windows is the one that puts
+      # executables in Scripts/ rather than bin/.
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            python-version: ""
+          - runner: ubuntu-latest
+            python-version: "3.13"
+          - runner: windows-latest
+            python-version: ""
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Guard this tree through the action
+        uses: ./guards
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      # workflow-tree is forwarded, not merely accepted: every leg above uses
+      # the default, so a dropped or misspelled forwarding would leave CI green
+      # and break the consumers who select another tree.
+      - name: Stage a tree somewhere else, and hide the default one
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p ci-fixture-tree
+          cp .github/workflows/test.yaml ci-fixture-tree/
+          # Moved aside, because both trees are valid: with the default still
+          # in place, dropping the forwarding would silently guard it and keep
+          # the next step green. The default path was already exercised by the
+          # step above, so nothing is lost by making it unavailable here.
+          mv .github/workflows "${RUNNER_TEMP}/hidden-workflows"
+
+      - name: Guard that tree instead
+        uses: ./guards
+        with:
+          workflow-tree: ci-fixture-tree
+
+      # The leg above proves the conditional step ran, not that the version it
+      # was handed is the one that got selected: drop `python-version` from the
+      # setup-python call and it would fall back to this checkout's
+      # .python-version, and every guard would still pass.
+      - name: Check the requested interpreter is the one on PATH
+        if: matrix.python-version != ''
+        shell: bash
+        env:
+          REQUESTED: ${{ matrix.python-version }}
+        run: |
+          set -euo pipefail
+          actual=$(python --version 2>&1)
+          case "$actual" in
+            "Python ${REQUESTED}"*) echo "selected: ${actual}" ;;
+            *) echo "::error::asked for ${REQUESTED}, PATH offers ${actual}."; exit 1 ;;
+          esac
+
+      # The root manifest is a guard of its own — it exists to fail — so a
+      # regression that let it succeed would remove the diagnostic without
+      # removing anything CI notices.
+      - name: Address the root, which must refuse
+        id: root
+        continue-on-error: true
+        uses: ./
+
+      - name: Assert it refused
+        shell: bash
+        env:
+          OUTCOME: ${{ steps.root.outcome }}
+        run: |
+          set -euo pipefail
+          if [[ "$OUTCOME" != "failure" ]]; then
+            echo "::error::the root manifest reported '${OUTCOME}'; it is supposed to fail and name the sub-actions."
+            exit 1
+          fi
+
+  # The isolation the action advertises, run against a checkout built to
+  # break it. Every other leg uses this repository's own benign configuration,
+  # so deleting the overrides would leave them all green — the guarantee would
+  # survive as prose long after the code stopped providing it.
+  isolation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Make this checkout hostile to the action
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import pathlib
+          # Every ini setting the action overrides, at once. Each of these
+          # broke it during review, one round at a time.
+          hostile = [
+              'addopts = "--cov --strict-markers"',
+              'required_plugins = ["pytest-cov"]',
+              'minversion = "99.0"',
+              'usefixtures = ["a_fixture_only_this_project_defines"]',
+              'python_files = ["*_spec.py"]',
+              'python_functions = ["should_*"]',
+              'python_classes = ["Describe*"]',
+              'pythonpath = ["."]',
+          ]
+          path = pathlib.Path("pyproject.toml")
+          text = path.read_text()
+          marker = "[tool.pytest.ini_options]\n"
+          assert marker in text, "pytest ini section moved; this fixture needs updating"
+          path.write_text(text.replace(marker, marker + "\n".join(hostile) + "\n", 1))
+          PY
+          # A conftest importing what this environment does not hold, and a
+          # module that shadows one of the guard pack's own dependencies.
+          printf 'import a_module_this_environment_does_not_have  # noqa\n' > conftest.py
+          printf 'raise SystemExit("checked-out code ran inside the guard invocation")\n' > yaml.py
+
+      - name: The guards run anyway
+        uses: ./guards
+        env:
+          # The environment half, set the way a caller reasonably might.
+          PYTEST_ADDOPTS: "--cov"
+          PYTEST_DISABLE_PLUGIN_AUTOLOAD: "1"
+          PYTEST_PLUGINS: absent_plugin
+          # The interpreter-level twin of the pythonpath ini setting, pointed
+          # at the checkout's shadowing yaml.py.
+          PYTHONPATH: "."
+
+  # One context that speaks for everything above it. The default branch's
+  # ruleset requires status contexts by name, and the ones it names are the
+  # verify matrix — so every job added here is advisory until the ruleset
+  # learns about it, and a job nobody requires is a job that can fail
+  # unnoticed. This aggregates instead: it depends on the others, runs even
+  # when they fail (a skipped job reports as passing, which is the shape
+  # `gate` exists to handle in dependabot-automerge.yaml), and fails unless
+  # each concluded success. Required in their place it also ends the coupling
+  # AGENTS.md warns about, since renaming a matrix leg would no longer rename
+  # a required context.
+  verified:
+    needs: [verify, action, isolation]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    steps:
+      - name: Fail unless every job above succeeded
+        env:
+          RESULTS: ${{ needs.verify.result }} ${{ needs.action.result }} ${{ needs.isolation.result }}
+        run: |
+          set -euo pipefail
+          for result in $RESULTS; do
+            if [[ "$result" != "success" ]]; then
+              echo "::error::a job this context speaks for concluded ${result}."
+              exit 1
+            fi
+          done
+          echo "Every job concluded success."

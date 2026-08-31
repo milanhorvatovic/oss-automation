@@ -1,0 +1,18 @@
+name: OSS Automation
+description: >-
+  This repository publishes several things, none of them addressed by its
+  root. Use the named sub-action.
+
+# A stub that fails rather than a default that guesses. A repository holding
+# reusable workflows, a pytest package and an action has no single obvious
+# meaning for `uses: milanhorvatovic/oss-automation@<sha>`, and GitHub's own
+# error for a missing manifest says only that it could not find one. This says
+# what to write instead.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        echo "::error::Address a sub-action rather than this repository's root: the guards are 'milanhorvatovic/oss-automation/guards@<sha>'. The reusable workflows are called as jobs, at 'milanhorvatovic/oss-automation/.github/workflows/<file>@<sha>' — see docs/consumers.md."
+        exit 1

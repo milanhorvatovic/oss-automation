@@ -225,7 +225,20 @@ The failure mode changes with this shape, and in your favour: a job that dies be
 
 ## The guard pack
 
-The structural tests need no App, no secret, and no settings. Install them from a tag or a commit and run them from your repository root:
+The structural tests need no App, no secret, and no settings. The shortest way to run them is the `guards` sub-action, in any job that has already checked your code out:
+
+```yaml
+      - uses: actions/checkout@<40-char-sha>                       # v7.0.1
+      - uses: milanhorvatovic/oss-automation/guards@<40-char-sha>  # vX.Y.Z
+        with:
+          workflow-tree: .github/workflows                         # the default
+```
+
+Your pytest configuration is read, but the settings that would decide *this* run are overridden: `addopts`, `required_plugins`, `minversion`, `usefixtures`, the collection patterns, your `conftest.py`, and the `PYTEST_*` environment variables that decide which plugins load. They belong to your suite, and this environment holds only the guard pack — a project whose tests are `*_spec.py`, or whose conftest imports its own package, would otherwise see the action fail without ever reading a workflow. `guards_trust_exempt` is still read from that same file.
+
+It installs the test-pack from the revision you pinned — so the code *grading* your tree is the one you reviewed, though its dependencies still come from an index — into a virtual environment of its own, leaving your job's Python as it found it. `python-version` sets up an interpreter first if the runner's own is not what you want; that one does change your job, because `setup-python` puts the interpreter it installs on the PATH and later steps in the same job will see it.
+
+If your project already runs pytest, take it as a development dependency instead and skip the action:
 
 ```bash
 pip install "oss-automation-guards @ git+https://github.com/milanhorvatovic/oss-automation@v0.1.0"

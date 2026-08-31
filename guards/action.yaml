@@ -1,0 +1,159 @@
+name: OSS Automation Guards
+description: >-
+  Run the structural guards against a repository's GitHub Actions workflow
+  tree — job timeouts, full-SHA action pins, explicit token scopes, and the
+  trust model of credentialed pull-request workflows.
+author: Milan Horvatovič
+
+# The step-shaped half of this repository, and the only half that belongs in an
+# action at all. The reusable workflows are jobs because their guarantees are
+# job-shaped — a credentialed job that checks out nothing, a publishing job
+# that shares no runner with caller-supplied code — and an action, which runs
+# inside the caller's job under the caller's token, cannot hold either
+# property. The guards need none of it: they read files in a tree already
+# checked out, under no credential.
+#
+# Runs on Linux, macOS and Windows runners, which costs two probes rather than
+# an assumption: the interpreter is python3 everywhere but Windows, and venv
+# writes its executables to bin/ everywhere but Windows. test.yaml exercises
+# both layouts, because a portability claim nothing runs is a guess.
+#
+# The package is installed from the checkout this action sits in rather than
+# from an index, so the code grading a consumer's tree is exactly the revision
+# they pinned, and the action works whether or not a release has reached PyPI.
+# The manifest lives one directory below the package it installs, which is why
+# the install path climbs out of `github.action_path`. The
+# cost is that pip resolves the build backend at install time; a consumer who
+# wants that pinned too installs the published wheel themselves and runs pytest
+# directly, which is the path docs/consumers.md still documents.
+
+inputs:
+  workflow-tree:
+    description: Directory of workflow files to guard.
+    required: false
+    default: .github/workflows
+  python-version:
+    description: >-
+      Python to run the guards under. Left empty, the runner's own
+      interpreter is used — `python3` where that name exists, `python` where
+      it does not — which spares the caller a toolchain setup they did not ask
+      for, provided that interpreter is 3.10 or newer: the package declares
+      `requires-python = ">=3.10"` and the install fails below it. Set this on
+      a runner whose default is older. Setting it runs
+      actions/setup-python, which puts that interpreter on the job's PATH and
+      leaves it there: the guards are isolated from the caller's environment,
+      but asking for an interpreter is a request to change it, and later steps
+      in the same job will see the one you asked for.
+    required: false
+    default: ""
+
+runs:
+  using: composite
+  steps:
+    - name: Set up Python
+      if: inputs.python-version != ''
+      uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+      with:
+        python-version: ${{ inputs.python-version }}
+
+    - name: Install the guard pack
+      shell: bash
+      env:
+        # The repository this action was checked out from: action_path names
+        # this directory, and the package it installs is its parent.
+        PACKAGE_PATH: ${{ github.action_path }}/..
+        GUARDS_VENV: ${{ runner.temp }}/oss-automation-guards
+      run: |
+        set -euo pipefail
+        # python3 on Linux and macOS runners, python on Windows, where the
+        # former is not the launcher. Neither name is portable on its own.
+        if command -v python3 >/dev/null 2>&1; then py=python3; else py=python; fi
+        # A virtual environment rather than the runner's interpreter: an action
+        # that installs into the caller's Python changes an environment it does
+        # not own, and later steps would inherit the difference. The install is
+        # what this isolates; the optional python-version input is a deliberate
+        # exception, since setup-python's PATH entry outlives this action by
+        # design and its description says so.
+        "$py" -m venv "$GUARDS_VENV"
+        # venv puts its executables in bin/ everywhere except Windows, which
+        # uses Scripts/. Probing beats branching on the runner's OS: the layout
+        # is what the next line needs, and it is right there to look at.
+        bin="${GUARDS_VENV}/bin"
+        [ -d "$bin" ] || bin="${GUARDS_VENV}/Scripts"
+        "${bin}/pip" install --disable-pip-version-check --quiet "$PACKAGE_PATH"
+
+    - name: Run the guards
+      shell: bash
+      env:
+        GUARDS_VENV: ${{ runner.temp }}/oss-automation-guards
+        # Emptied for this invocation, all three: the caller's addopts are
+        # arguments for the caller's own suite, and this environment holds only
+        # the guard pack. Disabling plugin autoload stops the guard pack's own
+        # pytest11 entry point from loading, which makes `--workflow-tree` an
+        # unknown argument — the isolation defeating itself. And PYTEST_PLUGINS
+        # names modules to import that only the caller's environment has.
+        PYTEST_ADDOPTS: ""
+        PYTEST_DISABLE_PLUGIN_AUTOLOAD: ""
+        PYTEST_PLUGINS: ""
+        WORKFLOW_TREE: ${{ inputs.workflow-tree }}
+      run: |
+        set -euo pipefail
+        # Unset rather than emptied: PYTHONPATH is read by the interpreter
+        # before pytest starts, so `-o pythonpath=` cannot reach it, and an
+        # empty value is not the same as an absent one — an empty entry is the
+        # working directory, which is the thing being excluded. A caller
+        # exporting `PYTHONPATH=.` beside a `yaml.py` would otherwise be
+        # offering this package a replacement for its own dependency.
+        unset PYTHONPATH
+        # Recomputed rather than carried over from the step above: an action
+        # that writes to GITHUB_ENV changes an environment the caller owns.
+        bin="${GUARDS_VENV}/bin"
+        [ -d "$bin" ] || bin="${GUARDS_VENV}/Scripts"
+        # The caller's pytest configuration decides things this invocation has
+        # no business inheriting, and each one fails it differently: addopts
+        # passes arguments this venv has no plugin for; required_plugins aborts
+        # before collection over a plugin it was never meant to hold; and the
+        # collection patterns decide whether the guard suite is seen at all — a
+        # project whose tests are `*_spec.py` collects nothing here and the
+        # action fails without ever reading a workflow. The collection
+        # overrides are pytest's own defaults, which is what the shipped suite
+        # is written to.
+        #
+        # pythonpath is the one with teeth rather than merely the one that
+        # breaks things: it prepends caller-chosen directories to sys.path, so
+        # a `pythonpath = ["."]` beside a `yaml.py` puts checked-out code where
+        # this package's own dependency should be — the tree under inspection
+        # supplying the library that inspects it. Its environment twin,
+        # PYTHONPATH, is unset in the step below, since the interpreter reads
+        # that one before pytest exists to override anything.
+        #
+        # Neither shadow fires today through a console-script pytest, which
+        # does not put the working directory on sys.path the way `python -c`
+        # does. That is a property of how this action happens to invoke pytest
+        # rather than a defence it offers, and not one to leave a guard pack
+        # resting on.
+        #
+        # minversion and usefixtures come from walking the rest of the ini
+        # rather than from waiting to be told: the first aborts the run when a
+        # caller pins a pytest newer than this venv installed, and the second
+        # applies a fixture to every test in the session, which here means one
+        # error per guard for a fixture only the caller's suite defines.
+        #
+        # --noconftest for the same reason, one layer out: a conftest.py at the
+        # caller's root is theirs, and it imports their dependencies, which
+        # this environment deliberately does not hold. The guard pack ships no
+        # conftest of its own, so there is nothing here to lose.
+        #
+        # What is deliberately still read is the rest of that file, because
+        # `guards_trust_exempt` — the documented way to declare a workflow a
+        # deliberate exception — is an ini option like any other.
+        "${bin}/pytest" --pyargs oss_automation_guards \
+          -o addopts= -o required_plugins= -o minversion=0 -o usefixtures= \
+          -o pythonpath= \
+          -o python_files="test_*.py" -o python_functions=test -o python_classes=Test \
+          --noconftest \
+          --workflow-tree "$WORKFLOW_TREE"
+
+branding:
+  icon: shield
+  color: green

@@ -16,7 +16,16 @@
 
 ## The verify matrix names required checks
 
-`verify.yaml`'s `python-version` matrix decides the status contexts the default branch's ruleset requires: `verify / test (3.10)` and `verify / test (3.14)`. Rename a leg and its context is renamed with it, leaving every open pull request waiting on a check that will never report — the ruleset is a repository setting, so no commit can fix it. Treat a matrix edit as a ruleset change first: have the required-checks list updated in the same sitting, or replace the two contexts with a single always-run aggregator job before touching the matrix at all.
+`verify.yaml`'s `python-version` matrix decides the status contexts the default branch's ruleset requires: `verify / test (3.10)` and `verify / test (3.14)`. Rename a leg and its context is renamed with it, leaving every open pull request waiting on a check that will never report — the ruleset is a repository setting, so no commit can fix it. Treat a matrix edit as a ruleset change first: have the required-checks list updated in the same sitting.
+
+`test.yaml` now carries that aggregator — a `verified` job depending on the others, running on `always()`, failing unless each concluded success. It is not required yet, because required contexts are a repository setting rather than a commit. Requiring it and dropping the two matrix contexts ends the coupling above, and makes every job in `test.yaml` gate a merge rather than only the two the ruleset happens to name:
+
+```bash
+gh api repos/milanhorvatovic/oss-automation/rulesets/20756252 \
+  --jq '.rules[] | select(.type=="required_status_checks")'   # inspect first
+```
+
+Then set `required_status_checks` to `gate` and `verified` alone.
 
 ## A workflow header is part of the change
 

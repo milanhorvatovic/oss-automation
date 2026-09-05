@@ -14,5 +14,5 @@ runs:
   steps:
     - shell: bash
       run: |
-        echo "::error::Address a sub-action rather than this repository's root: the guards are 'milanhorvatovic/oss-automation/guards@<sha>'. The reusable workflows are called as jobs, at 'milanhorvatovic/oss-automation/.github/workflows/<file>@<sha>' — see docs/consumers.md."
+        echo "::error::Address a sub-action rather than this repository's root: 'guards' runs the structural guards, 'python-dist' builds a wheel, an sdist and their SBOM, 'changelog-section' promotes a Keep a Changelog Unreleased section. Each is 'milanhorvatovic/oss-automation/<name>@<sha>'. The reusable workflows are called as jobs, at 'milanhorvatovic/oss-automation/.github/workflows/<file>@<sha>' — see docs/consumers.md."
         exit 1

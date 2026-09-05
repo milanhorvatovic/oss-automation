@@ -247,6 +247,17 @@ pytest --pyargs oss_automation_guards
 
 They read `.github/workflows` by default; `--workflow-tree` points them elsewhere. The rules they enforce are listed in [CONTRIBUTING.md](../CONTRIBUTING.md#what-the-guards-enforce). A workflow file that is a deliberate exception to the trust-model rule is declared through the `guards_trust_exempt` pytest ini option rather than by weakening the guard.
 
+## The step-shaped internals
+
+The release flow's two file-shaped halves are also sub-actions, for a project assembling its own pipeline rather than calling `release-tag`:
+
+- **`python-dist`** — builds a wheel and an sdist with `--no-isolation` against a hash-locked requirements file, generates a CycloneDX SBOM of what installing the wheel pulls in, and writes `SHA256SUMS`. **Linux runners only**, for two different reasons: Windows lays virtual environments out under `Scripts/` rather than `bin/`, and macOS — which uses `bin/` as Linux does — ships `shasum` rather than `sha256sum`. Inputs: `requirements` (default `requirements-release.txt`), `outdir` (default `dist`), `sbom-name` (default: named for the wheel; `SHA256SUMS` and `*.whl`/`*.tar.gz` are rejected, since they collide with the files written beside it). The action clears the artifacts it writes before each build, including a custom SBOM name you pass again — but if you *change* that name between builds into the same directory, removing the earlier file is yours to do. Outputs `sbom-path`.
+- **`changelog-section`** — promotes `## [Unreleased]` into a dated `## [X.Y.Z]`, carrying prose written there across above the generated list, and bumps the single `version = "…"` line in `pyproject.toml`. Inputs: `version`, `date`, `notes` (a file you produced), `repository`.
+
+Neither takes a credential or needs one; they read and write files. Publishing, attesting and uploading are not among them, because those need scopes, and a step that needs scopes belongs in a job that declares them — which is what `release-tag` and the caller shape above are for.
+
+`changelog-section` assumes what this repository's own release assumes: a Keep a Changelog file with an `## [Unreleased]` heading, and a `pyproject.toml` carrying exactly one `version = "…"` line. A project shaped differently wants its own step rather than an input on this one.
+
 ## Checking that it works
 
 The first Dependabot pull request is the test. On an eligible patch or minor bump you should see, in order: auto-merge armed, an approving review from your App, and the merge once your required checks go green. The arm deliberately precedes the approval — the approval can be the last merge requirement, so the merge method has to be settled before it lands. The run closes by annotating the tier it derived, the veto and commit-tamper-check states it read, and whether auto-merge was armed and the update approved — so a held update tells you which gate held it instead of leaving you to infer that from which steps ran. One exception: when the event that triggered the run already carried a veto label, the policy job is skipped and the disarm job annotates that hold instead. A label added after the event was emitted does not skip anything — that run reports the veto from its own live check. The approval corroborates it: it posts only for an eligible update, while a major or a privileged one is armed and left waiting for you.

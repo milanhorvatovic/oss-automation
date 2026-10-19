@@ -292,7 +292,7 @@ jobs:
       - name: Mint the automation-bot token
         id: bot-token
         if: env.AUTOMATION_CREDENTIALS_PRESENT == 'true'
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
@@ -1285,7 +1285,7 @@ jobs:
         if: >-
           steps.arm.outputs.verified-armed == 'true' || steps.arm.outputs.stale-approval-suspect == 'true'
         continue-on-error: true
-        uses: actions/create-github-app-token@bcd2ba49218906704ab6c1aa796996da409d3eb1 # v3.2.0
+        uses: actions/create-github-app-token@64ab729a6294000f5aa4a4bc0b73d1f32bc45510 # v3.3.0
         with:
           client-id: ${{ inputs.automation-client-id }}
           private-key: ${{ secrets.automation-private-key }}
